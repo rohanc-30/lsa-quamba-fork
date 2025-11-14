@@ -22,6 +22,22 @@ from torch.utils.cpp_extension import (
     CUDA_HOME,
 )
 
+# Monkey-patch PyTorch's _get_cuda_arch_flags to support sm_75
+# PyTorch 2.4.0 doesn't recognize sm_75 in its hardcoded list
+_original_get_cuda_arch_flags = cpp_extension._get_cuda_arch_flags
+
+def _patched_get_cuda_arch_flags(cflags):
+    """Patched version that adds sm_75 support"""
+    try:
+        return _original_get_cuda_arch_flags(cflags)
+    except ValueError as e:
+        if "Unknown CUDA arch (75)" in str(e) or "Unknown CUDA arch (7.5)" in str(e):
+            # If sm_75 is not recognized, return empty list and let explicit flags handle it
+            return []
+        raise
+
+cpp_extension._get_cuda_arch_flags = _patched_get_cuda_arch_flags
+
 compute_capability = torch.cuda.get_device_capability()
 cuda_arch = compute_capability[0] * 100 + compute_capability[1] * 10
 
@@ -79,10 +95,26 @@ if CUDA_HOME is not None:
             "Note: make sure nvcc has a supported version by running nvcc -V."
         )
 
-# sm87 for Nano
-# cc_flag.append("-gencode")
-# cc_flag.append("arch=compute_87,code=sm_87")
-# cc_flag.append("-arch=sm_87")
+# Explicitly set architecture flags to bypass PyTorch's architecture validation
+# PyTorch 2.4.0 doesn't recognize sm_75 in its internal list, so we need to
+# explicitly pass -gencode flags directly to nvcc
+if compute_capability[0] == 7 and compute_capability[1] == 5:
+    # sm_75 (Turing architecture, e.g., RTX 20xx series)
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_75,code=sm_75")
+elif compute_capability[0] == 8 and compute_capability[1] == 7:
+    # sm_87 (Orin Nano)
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_87,code=sm_87")
+else:
+    # For other architectures, add explicit gencode flag
+    cc_flag.append("-gencode")
+    cc_flag.append(f"arch=compute_{compute_capability[0]}{compute_capability[1]},code=sm_{compute_capability[0]}{compute_capability[1]}")
+
+# Also set TORCH_CUDA_ARCH_LIST as a fallback
+if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+    current_arch = f"{compute_capability[0]}.{compute_capability[1]}"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = f"7.0;7.5;8.0;8.6;8.9;{current_arch}"
 
 ext_modules.append(
     CUDAExtension(
