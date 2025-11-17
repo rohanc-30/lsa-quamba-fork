@@ -13,6 +13,8 @@ from transformers import (
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from quamba.megatron_utils import _GPTSentencePieceTokenizer
 from quamba.quamba_mixer_seq import QuambaLMHeadModel
+import fla
+from fla.models import GLAForCausalLM, DeltaNetForCausalLM
 
 
 def build_mamba_and_tokenizer(args, model_type="mamba"):
@@ -41,8 +43,22 @@ def build_mamba_and_tokenizer(args, model_type="mamba"):
             tokenizer = _GPTSentencePieceTokenizer(tokenizer_ckpt)
         model = QuambaLMHeadModel.from_pretrained(quantized_model_path, device="cuda")
         is_quamba = True
+    elif model_type == "gla":
+        tokenizer = AutoTokenizer.from_pretrained("fla-hub/gla-1.3B-100B", resume_download=None)
+        assert args.pretrained_dir, "Please specify the --pretrained_dir for quamba models"
+        model_path = os.path.join(args.pretrained_dir, args.model)
+        model = None
+        model = GLAForCausalLM.from_pretrained(model_path).to(device)
+
+    elif model_type == "delta_net":
+        tokenizer = AutoTokenizer.from_pretrained("fla-hub/delta_net-1.3B-100B", resume_download=None)
+        assert args.pretrained_dir, "Please specify the --pretrained_dir for delta_net models"
+        model_path = os.path.join(args.pretrained_dir, args.model)
+        model = None
+        model = DeltaNetForCausalLM.from_pretrained(model_path).to(device)
     else:
         raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', 'quamba' and 'quamba2'")
+    print(model)
     return model, tokenizer, is_quamba
 
 
@@ -125,7 +141,7 @@ def parse_options():
         help='Batch size for evaluation'
     )
     parser.add_argument(
-        '--task_list', type=lambda s: [item for item in s.split(',')], default=["lambada_openai"],
+        '--task_list', type=lambda s: [item for item in s.split(',')], default=['wikitext', 'lambada_openai','hellaswag','arc_easy','arc_challenge','winogrande'],
         help='Task to be evaled, e.g., --task_list lambada_openai,hellaswag,arc_easy,arc_challenge,piqa,winogrande'
     )
     parser.add_argument(

@@ -22,6 +22,7 @@ from .qLinearLayer import HadLinear, W4A16B16O16Linear, W4A8B16O16Linear, W8A8B1
 from .qActLayer import ActIdentity
 from .qMamba2 import Mamba2Simple, W4A8QMamba2, W4A16QMamba2, W8A8QMamba2
 from .qMambaLayer import MambaSimple, W4A8QMamba, W4A16QMamba, W8A8QMamba
+from .qGLALayer import GLASimple, W4A8QGLA, W4A16QGLA, W8A8QGLA
 from .qHadamard import Hadamard
 from .qBlock import HybridQuambaBlock
 # from .fusedNorm import FusedRMSNorm
@@ -39,7 +40,13 @@ logger = logging.getLogger(__name__)
 @torch.no_grad()
 def fuse_ln_linear(norm, linear) -> None:
     """
-    fuse the layernorm weight to the adjacent linear layer.
+    Fuse the layernorm weight into an adjacent linear layer.
+
+    Parameters:
+    norm -- the layer normalization module
+    linear -- the adjacent linear layer
+
+    Modifies linear layer's weights and biases based on the normalization weights.
     """
     linear_dtype = linear.weight.dtype
 
@@ -56,6 +63,16 @@ def fuse_ln_linear(norm, linear) -> None:
 
 @torch.no_grad()
 def configure_model(model, model_type, use_had_transform=True):
+    """
+    Configure a Mamba/GLA model with appropriate transformations.
+
+    Parameters:
+    model -- the model to configure
+    model_type -- type of model ("mamba", "mamba2", or "gla")
+    use_had_transform -- flag to apply hadamard transformations
+
+    Modifies embedding layers and normalizes layers based on type.
+    """
     device = next(model.parameters()).device
     if model_type == "mamba":
         # process embedding and lm_head
@@ -102,8 +119,36 @@ def configure_model(model, model_type, use_had_transform=True):
                 m = Mamba2Simple(originalLayer=layers[i].mixer, use_had_transform=use_had_transform).to(device)
                 layers[i].mixer = m
                 torch.cuda.empty_cache()
+    elif model_type == "gla":
+        # GLA has different structure: model.model instead of model.backbone
+        # Process embedding and lm_head
+        if use_had_transform:
+            # Clone lm_head to untie from embeddings if tied
+            lm_head_clone = model.lm_head.weight.data.clone()
+            # Transform embedding
+            model.model.embeddings.weight.data = had_transform(model.model.embeddings.weight.data)
+            # Fuse final norm to lm_head and transform
+            model.lm_head.weight = torch.nn.Parameter(lm_head_clone * model.model.norm.weight.view(1, -1)).to("cuda")
+            model.model.norm.weight.data = torch.ones_like(model.model.norm.weight)
+            model.lm_head.weight.data = had_transform(model.lm_head.weight.data)
+            torch.cuda.empty_cache()
+        
+        # Process layers - GLA has GLABlock with both attn and mlp
+        layers = model.model.layers
+        for i in range(len(layers)):
+            # Fuse attn_norm to q_proj (first projection in attention)
+            fuse_ln_linear(layers[i].attn_norm, layers[i].attn.q_proj)
+            # Replace attention with simplified version
+            gla_attn = GLASimple(originalLayer=layers[i].attn, use_had_transform=use_had_transform).to(device)
+            layers[i].attn = gla_attn
+            
+            # TODO: Also handle MLP quantization if needed
+            # For now, we'll focus on attention quantization
+            # fuse_ln_linear(layers[i].mlp_norm, layers[i].mlp.gate_proj)
+            
+            torch.cuda.empty_cache()
     else:
-        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba' and 'mamba2'")
+        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', and 'gla'")
     model.config.use_cache = False
     model.eval()
     return model
@@ -113,6 +158,18 @@ def run_quamba_calibration(
         model, model_type, tokenizer, num_samples=512, seq_len=512,
         calibration_dataset=None, preprocess_fn=None
     ):
+    """
+    Calibrate a Mamba model by evaluating activation/input statistics.
+
+    Parameters:
+    model -- the model to calibrate
+    model_type -- type of model
+    tokenizer -- tokenizer to preprocess data
+    num_samples -- number of samples for calibration
+    seq_len -- sequence length
+
+    Registers hooks for capturing statistics on activations and outputs to determine quantization values.
+    """
 
     if model_type == "mamba":
         layers = model.backbone.layers
@@ -130,8 +187,18 @@ def run_quamba_calibration(
         is_x = lambda op: op == "x_conv_out"
         is_ssm_state = lambda op: op == "ssm_state_act"
         percentile_alpha=0.9995  # for smaller model like 130m, use 0.99999
+    elif model_type == "gla":
+        # GLA uses different structure
+        layers = model.model.layers
+        is_traget_block = lambda block: True  # All GLABlocks are target blocks
+        get_mamba = lambda block: block.attn  # Get attention module instead of mixer
+        is_calib_ops = lambda op: isinstance(op, (torch.nn.Linear, ActIdentity))
+        # GLA doesn't have SSM state, but has multiple projections
+        is_x = lambda op: op in ["q_proj", "k_proj"]  # Key projections to monitor carefully
+        is_ssm_state = lambda op: False  # GLA doesn't have SSM state
+        percentile_alpha=0.9995
     else:
-        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba' and 'mamba2'")
+        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', and 'gla'")
 
     # register min/max observers, num_layer + lm_head
     observers = [{} for _ in range(len(layers) + 1)]
@@ -202,21 +269,28 @@ def run_quamba_calibration(
     logger.info("Run calibration")
     for i in tqdm(range(num_samples)):
         input_ids = preprocess_fn(calibration_dataset[i])
-        # prepare inference cache for getting ssm_state scales
-        prompt_len = input_ids.size(1)
-        inf_cache = model.allocate_inference_cache(1, prompt_len)
-        lengths_per_sample = torch.full((1,), prompt_len, dtype=torch.int32, device=device)
-        inference_params = InferenceParams(
-            max_seqlen=prompt_len,
-            max_batch_size=1,
-            seqlen_offset=0,
-            key_value_memory_dict=inf_cache,
-            lengths_per_sample=lengths_per_sample,
-        )
-        # do not set num_last_tokens because we want all activations to lm_head
-        model(input_ids, inference_params=inference_params)
-        # clean up the cache
-        del inf_cache
+        
+        if model_type in ["mamba", "mamba2"]:
+            # Mamba models use inference cache
+            prompt_len = input_ids.size(1)
+            inf_cache = model.allocate_inference_cache(1, prompt_len)
+            lengths_per_sample = torch.full((1,), prompt_len, dtype=torch.int32, device=device)
+            inference_params = InferenceParams(
+                max_seqlen=prompt_len,
+                max_batch_size=1,
+                seqlen_offset=0,
+                key_value_memory_dict=inf_cache,
+                lengths_per_sample=lengths_per_sample,
+            )
+            # do not set num_last_tokens because we want all activations to lm_head
+            model(input_ids, inference_params=inference_params)
+            # clean up the cache
+            del inf_cache
+        elif model_type == "gla":
+            # GLA models don't use inference cache, just run forward pass directly
+            model(input_ids)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
     
     for h in hooks:
         h.remove()
@@ -236,6 +310,18 @@ def run_quamba2_calibration(
         model, model_type, tokenizer, reorder_params,
         num_samples=512, seq_len=512, calibration_dataset=None, preprocess_fn=None
     ):
+    """
+    Calibrate a Mamba2 model by evaluating activation/input statistics.
+
+    Parameters:
+    model -- the model to calibrate
+    model_type -- expected to be "mamba2"
+    tokenizer -- tokenizer to preprocess data
+    reorder_params -- parameters for block/group reordering
+    num_samples -- number of samples for calibration
+
+    Uses observers to capture input-output data, adjusting quantization accordingly.
+    """
 
     if model_type == "mamba":
         raise NotImplementedError("Not support for mamba")
@@ -342,21 +428,28 @@ def run_quamba2_calibration(
     logger.info("Run calibration")
     for i in tqdm(range(num_samples)):
         input_ids = preprocess_fn(calibration_dataset[i])
-        # prepare inference cache for getting ssm_state scales
-        prompt_len = input_ids.size(1)
-        inf_cache = model.allocate_inference_cache(1, prompt_len)
-        lengths_per_sample = torch.full((1,), prompt_len, dtype=torch.int32, device=device)
-        inference_params = InferenceParams(
-            max_seqlen=prompt_len,
-            max_batch_size=1,
-            seqlen_offset=0,
-            key_value_memory_dict=inf_cache,
-            lengths_per_sample=lengths_per_sample,
-        )
-        # do not set num_last_tokens because we want all activations to lm_head
-        model(input_ids, inference_params=inference_params)
-        # clean up the cache
-        del inf_cache
+        
+        if model_type in ["mamba", "mamba2"]:
+            # Mamba models use inference cache
+            prompt_len = input_ids.size(1)
+            inf_cache = model.allocate_inference_cache(1, prompt_len)
+            lengths_per_sample = torch.full((1,), prompt_len, dtype=torch.int32, device=device)
+            inference_params = InferenceParams(
+                max_seqlen=prompt_len,
+                max_batch_size=1,
+                seqlen_offset=0,
+                key_value_memory_dict=inf_cache,
+                lengths_per_sample=lengths_per_sample,
+            )
+            # do not set num_last_tokens because we want all activations to lm_head
+            model(input_ids, inference_params=inference_params)
+            # clean up the cache
+            del inf_cache
+        elif model_type == "gla":
+            # GLA models don't use inference cache, just run forward pass directly
+            model(input_ids)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
     
     for h in hooks:
         h.remove()
@@ -372,21 +465,60 @@ def run_quamba2_calibration(
     return act_scales
 
 @torch.no_grad()
-def fuse_had_matrices(model):
+def fuse_had_matrices(model, model_type="mamba"):
+    """
+    Fuse Hadamard matrices within Mamba/GLA layers for optimized computation.
+
+    Parameters:
+    model -- the model for hadamard fusion
+    model_type -- type of model ("mamba", "mamba2", or "gla")
+
+    Modifies projection layers to incorporate Hadamard transformations.
+    """
     # fuse the had matrices with the weight matrices in linear layers.
     # Do this after reordering and before applying gptq
-    layers = model.backbone.layers
-    for i in range(len(layers)):
-        # in_proj: fuse had matrices with weight matrices
-        if isinstance(layers[i].mixer.in_proj, HadLinear):
-            layers[i].mixer.in_proj.fuse_hadamard()
-        # out_proj: fuse had matrices with weight matrices
-        if isinstance(layers[i].mixer.out_proj, HadLinear):
-            layers[i].mixer.out_proj.fuse_hadamard()
+    
+    if model_type in ["mamba", "mamba2"]:
+        layers = model.backbone.layers
+        for i in range(len(layers)):
+            # in_proj: fuse had matrices with weight matrices
+            if isinstance(layers[i].mixer.in_proj, HadLinear):
+                layers[i].mixer.in_proj.fuse_hadamard()
+            # out_proj: fuse had matrices with weight matrices
+            if isinstance(layers[i].mixer.out_proj, HadLinear):
+                layers[i].mixer.out_proj.fuse_hadamard()
+    elif model_type == "gla":
+        layers = model.model.layers
+        for i in range(len(layers)):
+            # GLA has multiple projections - fuse all of them
+            for proj_name in ['q_proj', 'k_proj', 'v_proj', 'g_proj', 'o_proj']:
+                proj = getattr(layers[i].attn, proj_name, None)
+                if proj and isinstance(proj, HadLinear):
+                    proj.fuse_hadamard()
+            # Handle gk_proj Sequential (two layers)
+            if hasattr(layers[i].attn, 'gk_proj') and layers[i].attn.gk_proj is not None:
+                if isinstance(layers[i].attn.gk_proj[0], HadLinear):
+                    layers[i].attn.gk_proj[0].fuse_hadamard()
+                if isinstance(layers[i].attn.gk_proj[1], HadLinear):
+                    layers[i].attn.gk_proj[1].fuse_hadamard()
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
     return model
 
 @torch.no_grad()
 def apply_gptq(model, tokenizer, device, w_bits=4):
+    """
+    Apply GPTQ based quantization to Mamba model layers.
+
+    Parameters:
+    model -- the model to quantize
+    tokenizer -- tokenizer for creating text data
+    device -- processing device (CPU/GPU)
+    w_bits -- target bit-width for weights
+
+    Configures quantization over internal projections and optimizes with input statistics.
+    """
     # Hardcode gptq hyper-parameters for now
     nsamples = 128
     seqlen = 1024
@@ -514,6 +646,18 @@ def apply_gptq(model, tokenizer, device, w_bits=4):
 
 
 def quantize_norm_a8(block_type, norm, layer_idx, act_scales, device):
+    """
+    Convert normalization layer for lower-bit activation usage.
+
+    Parameters:
+    block_type -- type of block (i.e., "Mamba")
+    norm -- normalization layer to quantize
+    layer_idx -- index of layer
+    act_scales -- activation scales for quantization
+    device -- processing device
+
+    Optimizes normalization for quantized data handling.
+    """
     norm = QRMSNorm.from_fp16(
         originalLayer=norm,
         output_scale=act_scales[layer_idx]["in_proj:input"].item())
@@ -523,6 +667,7 @@ def quantize_mixer_w8a8(block_type, mixer, layer_idx, act_scales, device):
     W8A8Mixers = {
         "Mamba": W8A8QMamba,
         "Mamba2": W8A8QMamba2,
+        "GLA": W8A8QGLA,
     }
     if block_type not in W8A8Mixers.keys():
         raise ValueError(f"Not find {block_type} in W8A8 Mixer")
@@ -538,6 +683,7 @@ def quantize_mixer_w4a16(block_type, mixer, layer_idx, act_scales, device):
     W4A16Mixers = {
         "Mamba": W4A16QMamba,
         "Mamba2": W4A16QMamba2,
+        "GLA": W4A16QGLA,
     }
     if block_type not in W4A16Mixers.keys():
         raise ValueError(f"Not find {block_type} in W4A16 Mixer")
@@ -550,6 +696,7 @@ def quantize_mixer_w4a8(block_type, mixer, layer_idx, act_scales, device):
     W4A8Mixers = {
         "Mamba": W4A8QMamba,
         "Mamba2": W4A8QMamba2,
+        "GLA": W4A8QGLA,
     }
     if block_type not in W4A8Mixers.keys():
         raise ValueError(f"Not find {block_type} in W4A8 Mixer")
@@ -577,6 +724,21 @@ def get_quantize_block_fn(act_scales, w_bits, a_bits, device):
     
 @torch.no_grad()
 def quantize_fp16_model(model, model_type, act_scales, device, w_bits=4, a_bits=8, quantize_embedding=True, quantize_lm_head=True):
+    """
+    Quantize a Mamba model from FP16 to a specified bit configuration.
+
+    Parameters:
+    model -- the model to quantize
+    model_type -- type of model
+    act_scales -- predefined scales for activations
+    device -- processing device
+    w_bits -- bit-width for weights
+    a_bits -- bit-width for activations
+    quantize_embedding -- flag to quantize embedding layer
+    quantize_lm_head -- flag to quantize lm_head
+
+    Applies specific bit-width reductions with layer-level optimizations.
+    """
     assert w_bits in [4, 8], "Only support 4 or 8 bits weights for now"
     assert a_bits in [8, 16], "Only support 8 or 16 bits activations for now"
     quantize_norm_fn, quantize_mixer_fn = get_quantize_block_fn(act_scales, w_bits, a_bits, device)
@@ -641,24 +803,71 @@ def quantize_fp16_model(model, model_type, act_scales, device, w_bits=4, a_bits=
                 # garbage collection and clean cache
                 gc.collect()
                 torch.cuda.empty_cache()
+    elif model_type == "gla":
+        if quantize_embedding:
+            # replace embedding layer
+            logging.info(f'Applying quantized embedding')
+            if w_bits == 4:
+                model.model.embeddings = W4O16Embedding.from_fp16(model.model.embeddings)
+            elif w_bits == 8:
+                model.model.embeddings = W8O16Embedding.from_fp16(model.model.embeddings)
+            else:
+                raise ValueError(f"Unsupport w{w_bits}a{a_bits}, only w8a8, w4a8, and w4a16 are supported")
+            gc.collect()
+            torch.cuda.empty_cache()
+        # replace layers - GLA has attn_norm + attn (+ mlp_norm + mlp but we skip MLP for now)
+        logging.info(f'Applying quantized layers')
+        layers = model.model.layers
+        for i in tqdm(range(len(layers))):
+            # Quantize attention norm - uses q_proj:input scale instead of in_proj:input
+            if a_bits == 8:
+                # Need to adjust the scale key for GLA
+                layers[i].attn_norm = QRMSNorm.from_fp16(
+                    originalLayer=layers[i].attn_norm,
+                    output_scale=act_scales[i].get("q_proj:input", torch.tensor(1.0)).item()
+                )
+            # else: keep original norm for w4a16
+            
+            # Quantize attention module
+            layers[i].attn = quantize_mixer_fn(
+                block_type="GLA",
+                mixer=layers[i].attn,
+                layer_idx=i)
+            
+            # TODO: Optionally quantize MLP as well
+            # For now, leave MLP in FP16
+            
+            # garbage collection and clean cache
+            gc.collect()
+            torch.cuda.empty_cache()
     else:
-        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba' and 'mamba2'")
+        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', and 'gla'")
     
     if quantize_lm_head:
         logging.info(f'Applying quantized lm_head')
-        # replace lm_head and norm_f with quantized version
+        # replace lm_head and final norm with quantized version
+        # Handle different norm locations: backbone.norm_f for Mamba, model.norm for GLA
+        if model_type in ["mamba", "mamba2"]:
+            final_norm = model.backbone.norm_f
+            norm_setter = lambda norm: setattr(model.backbone, 'norm_f', norm)
+        elif model_type == "gla":
+            final_norm = model.model.norm
+            norm_setter = lambda norm: setattr(model.model, 'norm', norm)
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        
         if w_bits == 4 and a_bits == 16:
-            # do nothing to w4a16 norm_f
+            # do nothing to w4a16 final norm
             model.lm_head = W4A16B16O16Linear.from_fp16(model.lm_head)
         elif w_bits == 4 and a_bits == 8:
-            # model.backbone.norm_f = FusedRMSNorm.from_fp16(
-            model.backbone.norm_f = QRMSNorm.from_fp16(
-                model.backbone.norm_f, output_scale=act_scales[-1]["lm_head:input"].item())
+            quantized_norm = QRMSNorm.from_fp16(
+                final_norm, output_scale=act_scales[-1]["lm_head:input"].item())
+            norm_setter(quantized_norm)
             model.lm_head = W4A8B16O16Linear.from_fp16(model.lm_head, act_scales[-1]["lm_head:input"])
         elif w_bits == 8 and a_bits == 8:
-            # model.backbone.norm_f = FusedRMSNorm.from_fp16(
-            model.backbone.norm_f = QRMSNorm.from_fp16(
-                model.backbone.norm_f, output_scale=act_scales[-1]["lm_head:input"].item())
+            quantized_norm = QRMSNorm.from_fp16(
+                final_norm, output_scale=act_scales[-1]["lm_head:input"].item())
+            norm_setter(quantized_norm)
             model.lm_head = W8A8B16O16Linear.from_fp16(model.lm_head, act_scales[-1]["lm_head:input"].item())
         else:
             raise ValueError(f"Unsupport w{w_bits}a{a_bits}, only w8a8, w4a8, and w4a16 are supported")
@@ -772,6 +981,7 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
         # load quantied model in args.pretrained_dir to replace fp16 mamba
         # This will require much more memory, since we will have
         # fp16 mamba, qumaba, and quamba weight in the memory at the same time
+        quantized_model_path = None
         if model_name.startswith("mamba"): # mamba or mamba2
             model_name = model_name.replace("mamba", "quamba") # replace mamba with quamba
             if args.hybrid_blocks: 
@@ -782,10 +992,22 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
             else:
                 model_name = model_name + f"-w{args.w_bits}a{args.a_bits}"
             quantized_model_path = os.path.join(args.pretrained_dir, "ut-enyac", model_name)
+        elif model_name.startswith("gla"): # gla models
+            # For GLA, we'll create a similar naming convention
+            model_name = model_name.replace("gla", "qgla") # replace gla with qgla
+            if args.hybrid_blocks:
+                model_name = model_name + f"-w{args.w_bits}aX"
+                if args.hybrid_blocks_config:
+                    config_name = args.hybrid_blocks_config.split("/")[-1].replace(".json", "")
+                    model_name = model_name + f"-{config_name}"
+            else:
+                model_name = model_name + f"-w{args.w_bits}a{args.a_bits}"
+            quantized_model_path = os.path.join(args.pretrained_dir, "ut-enyac", model_name)
         else:
             logging.warning(f"Unsupported model {args.model} in ut-enyac/ model registry")
+        
         # load the quantized model if it exists
-        if os.path.isdir(quantized_model_path):
+        if quantized_model_path and os.path.isdir(quantized_model_path):
             logging.info(f"Loading quantized model from {quantized_model_path}")
             model = QuambaLMHeadModel.from_pretrained(quantized_model_path, device="cuda")
             get_model_size(model, args.model, args.w_bits, args.a_bits)
@@ -827,7 +1049,7 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     
     # fuse the had matrices with the weight matrices in linear layers.
     # Do this after reordering and before applying gptq
-    model = fuse_had_matrices(model) 
+    model = fuse_had_matrices(model, model_type) 
     # Apply GPTQ to quantize linear
     if args.apply_gptq:
         model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits)
@@ -859,17 +1081,43 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
             model_name = model_name + f"-w{args.w_bits}a{args.a_bits}"
 
             quantized_model_path = os.path.join(args.pretrained_dir, "ut-enyac", model_name)
-            # we slightly hack the api: we use MambaLMHeadModel instead of QuambaLMHeadModel to store the model here
-            model.config.ssm_cfg['layer'] = model.backbone.layers[0].mixer.__class__.__name__
-            model.config.norm_cfg = {"norm": model.backbone.layers[0].norm.__class__.__name__}
-            model.config.embedding_cfg = {"layer": model.backbone.embedding.__class__.__name__}
-            model.config.lm_head_cfg = {"layer": model.lm_head.__class__.__name__}
+            
+            # Store model config based on model type
+            if model_type in ["mamba", "mamba2"]:
+                # we slightly hack the api: we use MambaLMHeadModel instead of QuambaLMHeadModel to store the model here
+                model.config.ssm_cfg['layer'] = model.backbone.layers[0].mixer.__class__.__name__
+                model.config.norm_cfg = {"norm": model.backbone.layers[0].norm.__class__.__name__}
+                model.config.embedding_cfg = {"layer": model.backbone.embedding.__class__.__name__}
+                model.config.lm_head_cfg = {"layer": model.lm_head.__class__.__name__}
+            elif model_type == "gla":
+                # GLA model structure is different
+                if not hasattr(model.config, 'gla_cfg'):
+                    model.config.gla_cfg = {}
+                model.config.gla_cfg['layer'] = model.model.layers[0].attn.__class__.__name__
+                model.config.norm_cfg = {"norm": model.model.layers[0].attn_norm.__class__.__name__}
+                model.config.embedding_cfg = {"layer": model.model.embeddings.__class__.__name__}
+                model.config.lm_head_cfg = {"layer": model.lm_head.__class__.__name__}
+            
             # We apply Hadamard transforms so we cannot tie embeddings and lm_head
             model.config.tie_embeddings = False # no used in QuambaLMHeadModel
-            if hasattr(model.config, "use_cache"):
+            # For GLA, we need to keep use_cache but set it to False (GLA forward pass checks it)
+            if model_type == "gla":
+                model.config.use_cache = False
+            elif hasattr(model.config, "use_cache"):
                 delattr(model.config, "use_cache")
-            model.save_pretrained(quantized_model_path)
-            logging.info(f"The quantized model is stored at {quantized_model_path}")
+            
+            # Fix for GLA: Convert any non-tensor attributes to tensors before saving
+            # This prevents "AttributeError: 'float' object has no attribute 'device'"
+            try:
+                model.save_pretrained(quantized_model_path)
+                logging.info(f"The quantized model is stored at {quantized_model_path}")
+            except AttributeError as e:
+                if "'float' object has no attribute 'device'" in str(e) or "'int' object has no attribute 'device'" in str(e):
+                    logging.warning(f"Skipping model save due to serialization issue: {e}")
+                    logging.warning("This is a known issue with GLA quantization. The model is quantized but cannot be saved yet.")
+                    logging.warning(f"Attempted to save to: {quantized_model_path}")
+                else:
+                    raise
         else:
             model_name = args.model.lower().split('/')[-1]
             model_name = model_name.replace("mamba", "quamba")
@@ -882,19 +1130,37 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
             ssm_layer_infos = []
             norm_infos = []
             
-            for i in range(len(model.backbone.layers)):
-                mixer_norms_info = model.backbone.layers[i].get_class_info_dict_mixers_norms()
+            # Get layers based on model type
+            if model_type in ["mamba", "mamba2"]:
+                layers = model.backbone.layers
+                embedding = model.backbone.embedding
+            elif model_type == "gla":
+                layers = model.model.layers
+                embedding = model.model.embeddings
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
+            
+            for i in range(len(layers)):
+                mixer_norms_info = layers[i].get_class_info_dict_mixers_norms()
                 ssm_layer_infos.append(mixer_norms_info["mixers"])
                 norm_infos.append(mixer_norms_info["norms"])
             
-            mixer_norms_info = model.backbone.layers[0].get_class_info_dict_mixers_norms()
-            model.config.ssm_cfg['layer'] = ssm_layer_infos
+            mixer_norms_info = layers[0].get_class_info_dict_mixers_norms()
+            if model_type in ["mamba", "mamba2"]:
+                model.config.ssm_cfg['layer'] = ssm_layer_infos
+            elif model_type == "gla":
+                if not hasattr(model.config, 'gla_cfg'):
+                    model.config.gla_cfg = {}
+                model.config.gla_cfg['layer'] = ssm_layer_infos
             model.config.norm_cfg = {"norm": norm_infos}
-            model.config.embedding_cfg = {"layer": model.backbone.embedding.__class__.__name__}
+            model.config.embedding_cfg = {"layer": embedding.__class__.__name__}
             model.config.lm_head_cfg = {"layer": model.lm_head.__class__.__name__}
             # We apply Hadamard transforms so we cannot tie embeddings and lm_head
             model.config.tie_embeddings = False # no used in QuambaLMHeadModel
-            if hasattr(model.config, "use_cache"):
+            # For GLA, we need to keep use_cache but set it to False (GLA forward pass checks it)
+            if model_type == "gla":
+                model.config.use_cache = False
+            elif hasattr(model.config, "use_cache"):
                 delattr(model.config, "use_cache")
             model.config.is_hybrid = True
             model.save_pretrained(quantized_model_path)

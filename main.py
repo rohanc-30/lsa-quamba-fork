@@ -14,6 +14,9 @@ from quamba.modelutils_mamba import quantize_model_mamba
 def main(args):    
     model_name = args.model.lower().split('/')[-1]
     model_type = model_name.split('-')[0] # Assume that the models name is like "model_type-<model_size, model version>"
+    print(args.model)
+    print(model_type)
+    print(model_name)
     assert model_name != None, "Please check the model path."
     logging.info(f"Creating Model:{model_name}")
     model, tokenizer, is_quamba = build_mamba_and_tokenizer(args, model_type)
