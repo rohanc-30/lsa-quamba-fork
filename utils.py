@@ -43,12 +43,15 @@ def build_mamba_and_tokenizer(args, model_type="mamba"):
             tokenizer = _GPTSentencePieceTokenizer(tokenizer_ckpt)
         model = QuambaLMHeadModel.from_pretrained(quantized_model_path, device="cuda")
         is_quamba = True
-    elif model_type == "gla":
-        tokenizer = AutoTokenizer.from_pretrained("fla-hub/gla-1.3B-100B", resume_download=None)
+    elif model_type == "gla" or model_type == "gla_ptq":
+        tokenizer = AutoTokenizer.from_pretrained(f"fla-hub/gla-1.3B-100B", resume_download=None)
         assert args.pretrained_dir, "Please specify the --pretrained_dir for quamba models"
         model_path = os.path.join(args.pretrained_dir, args.model)
         model = None
-        model = GLAForCausalLM.from_pretrained(model_path).to(device)
+        if model_type == "gla":
+            model = GLAForCausalLM.from_pretrained(model_path).to(device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
 
     elif model_type == "delta_net":
         tokenizer = AutoTokenizer.from_pretrained("fla-hub/delta_net-1.3B-100B", resume_download=None)

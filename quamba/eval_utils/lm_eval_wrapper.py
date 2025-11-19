@@ -256,7 +256,7 @@ def eval_mamba_few_shot(model, tokenizer, model_type, batch_size=1, max_length=2
     
     if model_type == "mamba" or model_type == "mamba2" or model_type == "quamba" or model_type == "quamba2":
         lm_obj = MambaEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
-    elif model_type == "gla":
+    elif model_type == "gla" or model_type == "gla_ptq":
         lm_obj = GLAEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
     elif model_type == "delta_net":
         lm_obj = DeltaNetEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
@@ -294,7 +294,7 @@ def eval_mamba_generation(model, tokenizer, model_type, batch_size=1, max_length
     
     if model_type == "mamba" or model_type == "mamba2" or model_type == "quamba" or model_type == "quamba2":
         lm_obj = MambaEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
-    elif model_type == "gla":
+    elif model_type == "gla" or model_type == "gla_ptq":
         lm_obj = GLAEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
     elif model_type == "delta_net":
         lm_obj = DeltaNetEvalWrapper(model=model, tokenizer=tokenizer, max_length=max_length, batch_size=batch_size)
