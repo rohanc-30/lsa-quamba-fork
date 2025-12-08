@@ -14,7 +14,7 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from quamba.megatron_utils import _GPTSentencePieceTokenizer
 from quamba.quamba_mixer_seq import QuambaLMHeadModel
 import fla
-from fla.models import GLAForCausalLM, DeltaNetForCausalLM
+from fla.models import GLAForCausalLM, DeltaNetForCausalLM, RetNetForCausalLM
 
 
 def build_mamba_and_tokenizer(args, model_type="mamba"):
@@ -50,17 +50,128 @@ def build_mamba_and_tokenizer(args, model_type="mamba"):
         model = None
         if model_type == "gla":
             model = GLAForCausalLM.from_pretrained(model_path).to(device)
+            model.config.use_cache = False
+            model.eval()
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+            # For gla_ptq, check if it's weight-only quantization
+            import json
+            quant_config_path = os.path.join(model_path, "quantization_config.json")
+            if os.path.exists(quant_config_path):
+                with open(quant_config_path, 'r') as f:
+                    config = json.load(f)
+                quant_config = config.get('quantization', {})
+                
+                # Check if weight-only quantization
+                if quant_config.get('weight_only', False) or quant_config.get('requires_special_loading', False):
+                    print(f"Detected weight-only quantized model, loading with special handler...")
+                    # Use custom loader for weight-only quantization
+                    from torchao_baseline.utils_torchao import load_weight_only_quantized_model
+                    model = load_weight_only_quantized_model(model_path, device=device)
+                else:
+                    # W8A8: Load entire model object (QuantizedLinear requirement)
+                    model = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=device, weights_only=False)
+            else:
+                # No quantization config, try standard loading
+                model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
 
-    elif model_type == "delta_net":
+    elif model_type == "mamba2_ptq":
+        if "mamba2-8b" not in args.model:
+            tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", resume_download=None)
+        else:
+            tokenizer_ckpt = os.path.join(args.pretrained_dir, args.model, "mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model")
+            tokenizer = _GPTSentencePieceTokenizer(tokenizer_ckpt)
+        assert args.pretrained_dir, "Please specify the --pretrained_dir for mamba2_ptq models"
+        model_path = os.path.join(args.pretrained_dir, args.model)
+        
+        # For mamba2_ptq, check if it's weight-only quantization
+        import json
+        quant_config_path = os.path.join(model_path, "quantization_config.json")
+        if os.path.exists(quant_config_path):
+            with open(quant_config_path, 'r') as f:
+                config = json.load(f)
+            quant_config = config.get('quantization', {})
+            
+            # Check if weight-only quantization
+            if quant_config.get('weight_only', False) or quant_config.get('requires_special_loading', False):
+                print(f"Detected weight-only quantized model, loading with special handler...")
+                # Use custom loader for weight-only quantization
+                from torchao_baseline.utils_torchao import load_weight_only_quantized_model
+                model = load_weight_only_quantized_model(model_path, device=device)
+            else:
+                # W8A8: Load entire model object (QuantizedLinear requirement)
+                model = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=device, weights_only=False)
+        else:
+            # No quantization config, try standard loading
+            model = MambaLMHeadModel.from_pretrained(model_path, device=device, dtype=dtype)
+    
+    elif model_type == "delta_net" or model_type == "delta_net_ptq":
         tokenizer = AutoTokenizer.from_pretrained("fla-hub/delta_net-1.3B-100B", resume_download=None)
         assert args.pretrained_dir, "Please specify the --pretrained_dir for delta_net models"
         model_path = os.path.join(args.pretrained_dir, args.model)
         model = None
-        model = DeltaNetForCausalLM.from_pretrained(model_path).to(device)
+        if model_type == "delta_net":
+            model = DeltaNetForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(device)
+        else:
+            # For delta_net_ptq, check if it's weight-only quantization
+            import json
+            quant_config_path = os.path.join(model_path, "quantization_config.json")
+            if os.path.exists(quant_config_path):
+                with open(quant_config_path, 'r') as f:
+                    config = json.load(f)
+                quant_config = config.get('quantization', {})
+                
+                # Check if weight-only quantization
+                if quant_config.get('weight_only', False) or quant_config.get('requires_special_loading', False):
+                    print(f"Detected weight-only quantized model, loading with special handler...")
+                    # Use custom loader for weight-only quantization
+                    from torchao_baseline.utils_torchao import load_weight_only_quantized_model
+                    model = load_weight_only_quantized_model(model_path, device=device)
+                else:
+                    # W8A8: Load entire model object (QuantizedLinear requirement)
+                    model = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=device, weights_only=False).bfloat16()
+            else:
+                # No quantization config, try standard loading with bfloat16
+                model = DeltaNetForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).to(device)
+    elif model_type == "retnet" or model_type == "retnet_ptq":
+        tokenizer = AutoTokenizer.from_pretrained("fla-hub/retnet-1.3B-100B", resume_download=None)
+        assert args.pretrained_dir, "Please specify the --pretrained_dir for retnet models"
+        model_path = os.path.join(args.pretrained_dir, args.model)
+        model = None
+        if model_type == "retnet":
+            model = RetNetForCausalLM.from_pretrained(model_path).to(device)
+        else:
+            # For retnet_ptq, check if it's weight-only quantization
+            import json
+            quant_config_path = os.path.join(model_path, "quantization_config.json")
+            
+            # Debug: Print what we're looking for
+            print(f"DEBUG: Looking for quantization config at: {quant_config_path}")
+            print(f"DEBUG: File exists: {os.path.exists(quant_config_path)}")
+            if os.path.exists(model_path):
+                print(f"DEBUG: Contents of {model_path}:")
+                print(f"  {os.listdir(model_path)}")
+            
+            if os.path.exists(quant_config_path):
+                with open(quant_config_path, 'r') as f:
+                    config = json.load(f)
+                quant_config = config.get('quantization', {})
+                
+                # Check if weight-only quantization
+                if quant_config.get('weight_only', False) or quant_config.get('requires_special_loading', False):
+                    print(f"Detected weight-only quantized model, loading with special handler...")
+                    # Use custom loader for weight-only quantization
+                    from torchao_baseline.utils_torchao import load_weight_only_quantized_model
+                    model = load_weight_only_quantized_model(model_path, device=device)
+                else:
+                    # W8A8: Load entire model object (QuantizedLinear requirement)
+                    model = torch.load(os.path.join(model_path, "pytorch_model.bin"), map_location=device, weights_only=False)
+            else:
+                # No quantization config, try standard loading
+                print(f"WARNING: No quantization config found, attempting standard loading...")
+                print(f"WARNING: This will likely fail. Expected file: {quant_config_path}")
+                model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
     else:
-        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', 'quamba' and 'quamba2'")
+        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba', 'mamba2', 'quamba', 'quamba2', 'gla_ptq', 'mamba2_ptq', 'delta_net', 'delta_net_ptq', 'retnet', 'retnet_ptq'")
     print(model)
     return model, tokenizer, is_quamba
 

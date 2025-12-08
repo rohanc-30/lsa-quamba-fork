@@ -37,7 +37,7 @@ if [[ "$MODEL" != *"quamba"* ]]; then
         CMD+=" --quantize --w_bits 4 --a_bits 8 --apply_gptq --quantize_embedding --quantize_lm_head"
         ;;
     w4a16)
-        CMD+=" --quantize --w_bits 4 --a_bits 16 --apply_gptq --quantize_embedding --quantize_lm_head"
+        CMD+=" --quantize --w_bits 4 --a_bits 16 --apply_gptq"
         ;;
     *)
         echo "Unsupported precision: $PRECISION"

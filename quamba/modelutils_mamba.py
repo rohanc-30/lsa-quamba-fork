@@ -507,7 +507,7 @@ def fuse_had_matrices(model, model_type="mamba"):
     return model
 
 @torch.no_grad()
-def apply_gptq(model, tokenizer, device, w_bits=4):
+def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
     """
     Apply GPTQ based quantization to Mamba model layers.
 
@@ -531,16 +531,30 @@ def apply_gptq(model, tokenizer, device, w_bits=4):
     logging.info("Build calibration loader for GPTQ")
     #build dataloader
     dataloader, _ = get_loaders("wikitext2", tokenizer, nsamples=nsamples, seqlen=seqlen)
-    layers = model.backbone.layers
-    model.backbone.embedding = model.backbone.embedding.to(device)
+    if model_type in ["mamba", "mamba2"]:
+        layers = model.backbone.layers
+        model.backbone.embedding = model.backbone.embedding.to(device)
+    elif model_type == "gla":
+        layers = model.model.layers
+        model.model.embeddings = model.model.embeddings.to(device)
     layers[0] = layers[0].to(device)
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, seqlen, model.config.d_model), dtype=dtype, device=device
-    )    
-    residual = torch.zeros(
-        (nsamples, seqlen, model.config.d_model), dtype=dtype, device=device
-    )    
+
+    if model_type in ["mamba", "mamba2"]:
+        inps = torch.zeros(
+            (nsamples, seqlen, model.config.d_model), dtype=dtype, device=device
+        )    
+        residual = torch.zeros(
+            (nsamples, seqlen, model.config.d_model), dtype=dtype, device=device
+        ) 
+    elif model_type == "gla":
+        inps = torch.zeros(
+            (nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device
+        )    
+        residual = torch.zeros(
+            (nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device
+        ) 
+
 
     cache = {"i": 0}
     class Catcher(nn.Module):
@@ -565,28 +579,53 @@ def apply_gptq(model, tokenizer, device, w_bits=4):
 
     layers[0] = layers[0].module # remove Catcher
     layers[0] = layers[0].cpu()
-    model.backbone.embedding = model.backbone.embedding.cpu()
+    if model_type in ["mamba", "mamba2"]:
+        model.backbone.embedding = model.backbone.embedding.cpu()
+    elif model_type == "gla":
+        model.model.embeddings = model.model.embeddings.cpu()
     torch.cuda.empty_cache()
     for i in tqdm(range(len(layers))):
         # get layer
         layer = layers[i].to(device)
 
+        if model_type in ["mamba", "mamba2"]:
         # create GPTQ objects for in_proj and out_proj
-        gptq = {
-            "in_proj": GPTQ(layer.mixer.in_proj),
-            "out_proj": GPTQ(layer.mixer.out_proj),
-        }
-        handles = [
-            layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"])),
-            layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"]))
-        ]
-        for j in range(nsamples):
-            layer(
-                inps[j].unsqueeze(0), 
-                residual=residual[j].unsqueeze(0)
-            )
-        for h in handles:
-            h.remove()
+            gptq = {
+                "in_proj": GPTQ(layer.mixer.in_proj),
+                "out_proj": GPTQ(layer.mixer.out_proj),
+            }
+            handles = [
+                layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"])),
+                layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"]))
+            ]
+            for j in range(nsamples):
+                layer(
+                    inps[j].unsqueeze(0), 
+                    residual=residual[j].unsqueeze(0)
+                )
+            for h in handles:
+                h.remove()
+        elif model_type == "gla":
+            gptq = {
+                "q_proj": GPTQ(layer.attn.q_proj),
+                "k_proj": GPTQ(layer.attn.k_proj),
+                "v_proj": GPTQ(layer.attn.v_proj),
+                "g_proj": GPTQ(layer.attn.g_proj),
+                "o_proj": GPTQ(layer.attn.o_proj),
+            }
+            handles = [
+                layer.attn.q_proj.register_forward_hook(partial(add_batch, gptq=gptq["q_proj"])),
+                layer.attn.k_proj.register_forward_hook(partial(add_batch, gptq=gptq["k_proj"])),
+                layer.attn.v_proj.register_forward_hook(partial(add_batch, gptq=gptq["v_proj"])),
+                layer.attn.g_proj.register_forward_hook(partial(add_batch, gptq=gptq["g_proj"])),
+                layer.attn.o_proj.register_forward_hook(partial(add_batch, gptq=gptq["o_proj"])),
+            ]
+            for j in range(nsamples):
+                layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0))
+            for h in handles:
+                h.remove()
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
         
         # start running GPTQ
         for name in gptq.keys():
@@ -599,7 +638,16 @@ def apply_gptq(model, tokenizer, device, w_bits=4):
         
         # collect the outputs for the next layer
         for j in range(nsamples):
-            inps[j], residual[j] = layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0))
+            # print(layer)
+            # print()
+            # print()
+            # print(layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0)))
+            if model_type == "gla":
+                inps[j], _, _ = layer(inps[j].unsqueeze(0))
+                residual[j] = inps[j]
+            else:
+                inps[j], residual[j] = layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0))
+            # raise ValueError
         
         # garbage collection and clean cache
         layers[i] = layer.cpu()
@@ -609,24 +657,40 @@ def apply_gptq(model, tokenizer, device, w_bits=4):
 
     model = model.to("cpu") # move model to cpu to save memory
     model.lm_head = model.lm_head.to(device)
-    model.backbone.norm_f = model.backbone.norm_f.to(device)
+    if model_type in ["mamba", "mamba2"]:
+        model.backbone.norm_f = model.backbone.norm_f.to(device)
+    elif model_type == "gla":
+        model.model.norm = model.model.norm.to(device)
     logging.info("Quantizing lm_head with GPTQ")
     gptq_lm_head = GPTQ(model.lm_head)
     handle = model.lm_head.register_forward_hook(partial(add_batch, gptq=gptq_lm_head))
     
-    assert model.backbone.fused_add_norm, "Only support fused_add_norm=True for now"
+    # FIXME(HY): assert model.backbone.fused_add_norm, "Only support fused_add_norm=True for now"
     #Reference: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L202
-    final_hidden_states = layer_norm_fn(
-        x=inps,
-        weight=model.backbone.norm_f.weight,
-        bias=model.backbone.norm_f.bias,
-        eps=model.backbone.norm_f.eps,
-        residual=residual,
-        prenorm=False,
-        residual_in_fp32=model.backbone.residual_in_fp32,
-        is_rms_norm=isinstance(model.backbone.norm_f, RMSNorm),
-    )
+    if model_type in ["mamba", "mamba2"]:
+        final_hidden_states = layer_norm_fn(
+            x=inps,
+            weight=model.backbone.norm_f.weight,
+            bias=model.backbone.norm_f.bias,
+            eps=model.backbone.norm_f.eps,
+            residual=residual,
+            prenorm=False,
+            residual_in_fp32=model.backbone.residual_in_fp32,
+            is_rms_norm=isinstance(model.backbone.norm_f, RMSNorm),
+        )
     
+    elif model_type == "gla":
+        final_hidden_states = layer_norm_fn(
+            x=inps,
+            weight=model.model.norm.weight,
+            bias=model.model.norm.bias,
+            eps=model.model.norm.eps,
+            residual=residual,
+            prenorm=False,
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
     for j in range(nsamples):
         model.lm_head(final_hidden_states[j].unsqueeze(0))
 
@@ -1051,8 +1115,10 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     # Do this after reordering and before applying gptq
     model = fuse_had_matrices(model, model_type) 
     # Apply GPTQ to quantize linear
+    print(args.apply_gptq)
     if args.apply_gptq:
-        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits)
+        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        print(model)
     # Replace (reordered, fused, and GPTQ quantized) modules with quantized version
     
     if args.hybrid_blocks: # create hybrid block

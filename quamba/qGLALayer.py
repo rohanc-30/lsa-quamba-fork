@@ -193,9 +193,16 @@ class W4A16QGLA(nn.Module):
     
     def __init__(self, originalLayer, use_had_transform: bool = True):
         super().__init__()
+
+        # print(originalLayer)
         
         self.hidden_size = originalLayer.hidden_size if hasattr(originalLayer, 'hidden_size') else 2048
         self.num_heads = originalLayer.num_heads if hasattr(originalLayer, 'num_heads') else None
+
+        self.num_kv_groups = originalLayer.num_kv_groups
+        self.head_k_dim = originalLayer.head_k_dim
+        self.head_v_dim = originalLayer.head_v_dim
+        self.gate_logit_normalizer = originalLayer.gate_logit_normalizer
         
         # Convert all projections to W4A16
         self.q_proj = W4A16B16O16Linear.from_fp16(originalLayer.q_proj)
@@ -205,12 +212,15 @@ class W4A16QGLA(nn.Module):
         self.o_proj = W4A16B16O16Linear.from_fp16(originalLayer.o_proj)
         
         # Handle gk_proj Sequential
+        ''''
         if hasattr(originalLayer, 'gk_proj') and originalLayer.gk_proj is not None:
             gk_proj_0 = W4A16B16O16Linear.from_fp16(originalLayer.gk_proj[0])
             gk_proj_1 = W4A16B16O16Linear.from_fp16(originalLayer.gk_proj[1])
             self.gk_proj = nn.Sequential(gk_proj_0, gk_proj_1)
         else:
             self.gk_proj = None
+        '''
+        self.gk_proj = originalLayer.gk_proj
         
         # Keep gated norm as-is (no quantization for W4A16)
         self.g_norm_swish_gate = originalLayer.g_norm_swish_gate
@@ -242,32 +252,68 @@ class W4A16QGLA(nn.Module):
         """Forward pass for W4A16 quantized GLA - same as GLASimple but with quantized layers."""
         from einops import rearrange, repeat
         import torch.nn.functional as F
+        import logging
         
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2
         
         batch_size, q_len, _ = hidden_states.shape
         
+        # DEBUG: Check input
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in INPUT! range=[{hidden_states.min():.2f}, {hidden_states.max():.2f}]")
+        
+        # DEBUG: Check q_proj scales before forward
+        if hasattr(self.q_proj, 'scale'):
+            if torch.isnan(self.q_proj.scale).any() or (self.q_proj.scale == 0).any():
+                logging.error(f"❌ W4A16QGLA: q_proj has NaN or ZERO scales! min={self.q_proj.scale.min():.6f}")
+        
         # Use quantized projections
         if self.use_short_conv and hasattr(self, 'q_conv1d'):
+            print('conv1d path taken')
             q = self.q_conv1d(x=self.q_proj(hidden_states), cache=None, output_final_state=False)[0]
             k = self.k_conv1d(x=self.k_proj(hidden_states), cache=None, output_final_state=False)[0]
             v = self.v_conv1d(x=self.v_proj(hidden_states), cache=None, output_final_state=False)[0]
         else:
+            '''
+            print('linear path taken')
+            print(self.q_proj.scale)
+            print()
+            print(self.q_proj.weight)
+            print()
+            print(self.q_proj.bias)
+            print()
+            print(hidden_states)
+            print('--------------------------------')
+            print(self.q_proj)
+            '''
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
         
-        gk = self.gk_proj(hidden_states) if self.gk_proj is not None else k
+        # DEBUG: Check projections (disabled to let eval complete)
+        if torch.isnan(q).any() or torch.isinf(q).any():
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in Q!")
+        #     # raise ValueError("NaN in Q projection")  # Disabled to let eval complete
+        if torch.isnan(k).any() or torch.isinf(k).any():
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in K!")
+        if torch.isnan(v).any() or torch.isinf(v).any():
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in V!")
+        
+        # Get dtypes of self.gk_proj and hidden_states
+        # print(self.gk_proj.dtype)
+        # print(hidden_states.dtype)
+
+        gk = self.gk_proj(hidden_states.float()).half() if self.gk_proj is not None else k
         
         if hasattr(self, 'feature_map_fn') and self.feature_map_fn is not None:
             q = self.feature_map_fn(q)
             k = self.feature_map_fn(k)
         
-        head_k_dim = getattr(self, 'head_k_dim', 128)
-        head_v_dim = getattr(self, 'head_v_dim', 128)
-        num_kv_groups = getattr(self, 'num_kv_groups', 1)
-        gate_logit_normalizer = getattr(self, 'gate_logit_normalizer', 16)
+        head_k_dim = self.head_k_dim
+        head_v_dim = self.head_v_dim
+        num_kv_groups = self.num_kv_groups
+        gate_logit_normalizer = self.gate_logit_normalizer
         
         q = rearrange(q, '... (h d) -> ... h d', d=head_k_dim)
         
@@ -281,27 +327,66 @@ class W4A16QGLA(nn.Module):
             v = rearrange(v, '... (h d) -> ... h d', d=head_v_dim)
         
         gk = F.logsigmoid(gk) / gate_logit_normalizer
+
+        if torch.isnan(gk).any() or torch.isinf(gk).any():
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in GK!")
+            # raise ValueError("NaN in GK projection")
         
-        try:
-            from fla.ops.gla import chunk_gla, fused_recurrent_gla
-            mode = getattr(self, 'mode', 'chunk')
-            if q_len <= 64:
-                mode = 'fused_recurrent'
-            
-            if mode == 'fused_recurrent':
-                o, _ = fused_recurrent_gla(q=q, k=k, v=v, gk=gk, initial_state=None, output_final_state=False)
-            else:
-                o, _ = chunk_gla(q=q, k=k, v=v, g=gk, initial_state=None, output_final_state=False)
-        except ImportError:
+        # # DEBUG: Check all inputs to attention kernel  # DEBUG
+        # logging.info(f"  Before attention: q.shape={q.shape}, q.dtype={q.dtype}, has_nan={torch.isnan(q).any()}")  # DEBUG
+        # logging.info(f"  Before attention: k.shape={k.shape}, k.dtype={k.dtype}, has_nan={torch.isnan(k).any()}")  # DEBUG
+        # logging.info(f"  Before attention: v.shape={v.shape}, v.dtype={v.dtype}, has_nan={torch.isnan(v).any()}")  # DEBUG
+        # logging.info(f"  Before attention: gk.shape={gk.shape}, gk.dtype={gk.dtype}, has_nan={torch.isnan(gk).any()}")  # DEBUG
+        # logging.info(f"  Ranges: q[{q.min():.4f}, {q.max():.4f}], k[{k.min():.4f}, {k.max():.4f}], v[{v.min():.4f}, {v.max():.4f}], gk[{gk.min():.4f}, {gk.max():.4f}]")  # DEBUG
+        
+        # TEMPORARY: Force fallback to test if chunk_gla is the issue
+        use_fallback = False  # Set to False to use FLA kernels
+        
+        if not use_fallback:
+            try:
+                from fla.ops.gla import chunk_gla, fused_recurrent_gla
+                mode = getattr(self, 'mode', 'chunk')
+                if q_len <= 64:
+                    mode = 'fused_recurrent'
+                
+                # logging.info(f"  Using attention mode: {mode}")  # DEBUG
+                
+                if mode == 'fused_recurrent':
+                    o, _ = fused_recurrent_gla(q=q, k=k, v=v, gk=gk, initial_state=None, output_final_state=False)
+                    # logging.info(f"  After fused_recurrent_gla: o.shape={o.shape}, o.dtype={o.dtype}, has_nan={torch.isnan(o).any()}")  # DEBUG
+                else:
+                    o, _ = chunk_gla(q=q.float(), k=k.float(), v=v.float(), g=gk.float(), initial_state=None, output_final_state=False)
+                    # logging.info(f"  After chunk_gla: o.shape={o.shape}, o.dtype={o.dtype}, has_nan={torch.isnan(o).any()}")  # DEBUG
+            except ImportError:
+                use_fallback = True
+        
+        if use_fallback:
+            raise ValueError("Using fallback matmul attention")
+            # logging.info("  Using fallback matmul attention")  # DEBUG
             attn = torch.matmul(q, k.transpose(-2, -1)) * (head_k_dim ** -0.5)
             attn = F.softmax(attn, dim=-1)
             o = torch.matmul(attn, v)
         
+        # # DEBUG: Check attention output  # DEBUG
+        if torch.isnan(o).any() or torch.isinf(o).any():  # DEBUG
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in attention output O!")  # DEBUG
+            # raise ValueError("NaN produced by attention kernel (chunk_gla/fused_recurrent_gla)")  # DEBUG
+        
         if hasattr(self, 'g_proj'):
-            g = self.g_proj(hidden_states)
+            g = self.g_proj(hidden_states.half())
+            
+            # DEBUG: Check g_proj output  # DEBUG
+            if torch.isnan(g).any() or torch.isinf(g).any():  # DEBUG
+                logging.error(f"❌ W4A16QGLA: NaN/Inf in G! range=[{g.min():.2f}, {g.max():.2f}]")  # DEBUG
+            
             if hasattr(self, 'g_norm_swish_gate'):
                 g = rearrange(g, '... (h d) -> ... h d', d=head_v_dim)
                 o = self.g_norm_swish_gate(o, g)
+                
+                # DEBUG: Check after g_norm_swish_gate  # DEBUG
+                if torch.isnan(o).any() or torch.isinf(o).any():  # DEBUG
+                    logging.error(f"❌ W4A16QGLA: NaN/Inf after g_norm_swish_gate! range=[{o.min():.2f}, {o.max():.2f}]")  # DEBUG
+                
                 o = rearrange(o, '... h d -> ... (h d)')
             else:
                 o = rearrange(o, '... h d -> ... (h d)')
@@ -313,7 +398,12 @@ class W4A16QGLA(nn.Module):
             o = rearrange(o, '... h d -> ... (h d)')
         
         o = self.o_proj(o)
-        return o, None, None
+        
+        # # DEBUG: Check final output  # DEBUG
+        if torch.isnan(o).any() or torch.isinf(o).any():  # DEBUG
+            logging.error(f"❌ W4A16QGLA: NaN/Inf in FINAL OUTPUT! range=[{o.min():.2f}, {o.max():.2f}]")  # DEBUG
+        
+        return o.float(), None, None
 
 
 class W4A8QGLA(nn.Module):

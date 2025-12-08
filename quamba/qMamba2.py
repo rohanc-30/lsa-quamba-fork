@@ -510,6 +510,8 @@ class W4A16QMamba2(nn.Module):
             process_group = originalLayer.process_group,
         )
 
+        # print(originalLayer)
+
         # # input proj, weight group_size=128
         qmixer.in_proj = W4A16B16O16Linear.from_fp16(
             originalLayer=copy.deepcopy(originalLayer.in_proj),

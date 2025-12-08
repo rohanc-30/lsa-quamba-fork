@@ -1,3 +1,4 @@
+# from typing import assert_never
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,10 +88,35 @@ class W4A16B16O16Linear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
+        # CRITICAL: Convert to FP16 if needed (CUDA kernel expects FP16)
+        original_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.half()
+            # print(f"  ⚠️  Converted input from FP32 to FP16")  # DEBUG
+        
+        # assert not torch.isnan(self.scale).any(), "input_scale has NaN"  # DEBUG
+        # assert not torch.isnan(self.weight).any(), "weight has NaN"  # DEBUG
+        # assert not torch.isnan(self.workspace).any(), "workspace has NaN"  # DEBUG
+        # assert not torch.isnan(x).any(), "x has NaN"  # DEBUG
+        # print('passed init forward checks!')  # DEBUG
+        # print(f'  weight.shape={self.weight.shape}, scale.shape={self.scale.shape}')  # DEBUG
+        # print(f'  workspace.shape={self.workspace.shape}')  # DEBUG
+        # print(f'  x.shape={x.shape}')  # DEBUG
+        # print(f'  size_n={self.size_n}, size_k={self.size_k}, pad_out={self.pad_out}')  # DEBUG
+        # print(f'  scale min/max/mean: {self.scale.min():.6f}/{self.scale.max():.6f}/{self.scale.mean():.6f}')  # DEBUG
+        # print(f'  scale has zeros: {(self.scale == 0).any()}')  # DEBUG
+        # print(f'  scale has nan: {torch.isnan(self.scale).any()}')  # DEBUG
+        # print('--------------------------------')  # DEBUG
         x_shape = x.shape
         # this contiguous is necessary for batch size > 1 for lm_head
         # https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L281
         x = x.view(-1, x_shape[-1]).contiguous() # must squeeze the tensor first
+        
+        # print(f'  Calling CUDA kernel with:')  # DEBUG
+        # print(f'    m={x.shape[0]}, n={self.size_n}, k={self.size_k}')  # DEBUG
+        # print(f'    x.dtype={x.dtype}, x.device={x.device}, x.is_contiguous={x.is_contiguous()}')  # DEBUG
+        # print(f'    weight.dtype={self.weight.dtype}, scale.dtype={self.scale.dtype}')  # DEBUG
+        
         y = quant_linear_cuda.w4a16o16_gemm(
             x,
             self.weight,
@@ -101,6 +127,14 @@ class W4A16B16O16Linear(torch.nn.Module):
             self.size_k,    # k: in_features
             False, -1, -1, -1, self.max_par
         )
+        
+        # print(f'  CUDA kernel returned: y.shape={y.shape}, has_nan={torch.isnan(y).any()}, has_inf={torch.isinf(y).any()}')  # DEBUG
+        # if torch.isnan(y).any() or torch.isinf(y).any():  # DEBUG
+        #     print(f'  ❌ CUDA kernel produced NaN/Inf!')  # DEBUG
+        #     print(f'     y min/max: {y[~torch.isnan(y)].min() if (~torch.isnan(y)).any() else "all NaN"} / {y[~torch.isnan(y)].max() if (~torch.isnan(y)).any() else "all NaN"}')  # DEBUG
+        
+        # assert not torch.isnan(y).any(), "y has NaN after CUDA kernel"  # DEBUG
+        # print('passed forward checks!')  # DEBUG
         if self.pad_out != 0:
             y = y[:, 0:-self.pad_out]
         y = y.view(*x_shape[:-1], -1)
@@ -226,6 +260,9 @@ class W4A8B16O16Linear(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
+        assert not torch.isnan(self.input_scale).any(), "input_scale has NaN"
+        assert not torch.isnan(self.weight).any(), "weight has NaN"
+        print('passed init forward checks!')
         x_shape = x.shape
         # this contiguous is necessary for batch size > 1 for lm_head
         # https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L281
@@ -242,6 +279,8 @@ class W4A8B16O16Linear(torch.nn.Module):
             self.size_k,    # k: in_features
             False           # transpose output
         )
+        assert not torch.isnan(y).any(), "y has NaN"
+        print('passed forward checks!')
         if self.pad_out != 0:
             y = y[:, 0:-self.pad_out]
         y = y.view(*x_shape[:-1], -1) # [B*L, D] -> [B, L, D]

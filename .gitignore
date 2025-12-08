@@ -7,6 +7,7 @@ __pycache__/
 pretrained_models/
 logs/
 observer_stats_output/
+quantization_analysis_output/
 
 # C extensions
 *.so

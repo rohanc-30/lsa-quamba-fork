@@ -24,12 +24,14 @@ from torchao_baseline.utils_torchao import (
     prepare_for_static_w8a8,
     calibrate_static_quant,
     convert_static_w8a8,
+    convert_static_w4a16,
+    convert_static_w8a16,
     save_quantized_model,
 )
 
 def quantize_gla_model(save_model: bool = True):
     """
-    Complete W8A8 quantization workflow
+    Complete W8A8, W8A16, W4A16 quantization workflow
     
     Args:
         save_model: Whether to save the quantized model (default: True)
@@ -44,6 +46,92 @@ def quantize_gla_model(save_model: bool = True):
         model_type='gla',
         device='cuda'
     )
+    model2, tokenizer2, config2 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/gla-1.3b',
+        model_type='gla',
+        device='cuda'
+    )
+    model3, tokenizer3, config3 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/gla-1.3b',
+        model_type='gla',
+        device='cuda'
+    )
+
+    model4, tokenizer4, config4 = load_model_for_quantization(
+        model_path='pretrained_models/state-spaces/mamba2-1.3b',
+        model_type='mamba2',
+        device='cuda'
+    )
+
+    model5, tokenizer5, config5 = load_model_for_quantization(
+        model_path='pretrained_models/state-spaces/mamba2-1.3b',
+        model_type='mamba2',
+        device='cuda'
+    )
+
+    model6, tokenizer6, config6 = load_model_for_quantization(
+        model_path='pretrained_models/state-spaces/mamba2-1.3b',
+        model_type='mamba2',
+        device='cuda'
+    )
+
+    model7, tokenizer7, config7 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/delta_net-1.3b',
+        model_type='delta_net',
+        device='cuda'
+    )
+
+    model8, tokenizer8, config8 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/delta_net-1.3b',
+        model_type='delta_net',
+        device='cuda'
+    )
+
+    model9, tokenizer9, config9 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/delta_net-1.3b',
+        model_type='delta_net',
+        device='cuda'
+    )
+
+    
+    model10, tokenizer10, config10 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/retnet-1.3b',
+        model_type='retnet',
+        device='cuda'
+    )
+
+    model11, tokenizer11, config11 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/retnet-1.3b',
+        model_type='retnet',
+        device='cuda'
+    )
+
+    
+    model12, tokenizer12, config12 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/retnet-1.3b',
+        model_type='retnet',
+        device='cuda'
+    )
+
+    '''
+    model13, tokenizer13, config13 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/opt-1.3b',
+        model_type='opt',
+        device='cuda'
+    )
+
+    model14, tokenizer14, config14 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/opt-1.3b',
+        model_type='opt',
+        device='cuda'
+    )   
+
+    model15, tokenizer15, config15 = load_model_for_quantization(
+        model_path='pretrained_models/fla-hub/opt-1.3b',
+        model_type='opt',
+        device='cuda'
+    )
+    '''
     
     # Check 1: Verify model loaded
     print("\n[CHECK 1] Model loaded successfully")
@@ -85,6 +173,9 @@ def quantize_gla_model(save_model: bool = True):
     print("Step 2: Preparing model for quantization...")
     print("="*60)
     model = prepare_for_static_w8a8(model)
+    model6 = prepare_for_static_w8a8(model6)
+    model7 = prepare_for_static_w8a8(model7)
+    model10 = prepare_for_static_w8a8(model10)
     
     # Check 2: Verify observers inserted
     print("\n[CHECK 2] Observers inserted")
@@ -136,12 +227,47 @@ def quantize_gla_model(save_model: bool = True):
     print("\n" + "="*60)
     print("Step 3: Loading calibration data...")
     print("="*60)
+    # Use C4 for better calibration (more diverse than wikitext)
     calib_data = get_calibration_data(
         tokenizer=tokenizer,
         dataset_name='wikitext',
+        num_samples=512,      # More samples for better coverage
+        seq_len=512,          # Longer sequences
+        min_length=64,         # Ensure substantial sequences
+    )
+    
+    # Get calibration data for mamba2 tokenizer (for model6)
+    # Use C4 for better calibration coverage
+    calib_data_mamba = get_calibration_data(
+        tokenizer=tokenizer6,
+        dataset_name='wikitext',
         num_samples=512,
         seq_len=512,
-        min_length=64
+        min_length=64,
+    )
+
+    calib_data_deltanet = get_calibration_data(
+        tokenizer=tokenizer7,  # Use delta_net tokenizer, not GLA tokenizer
+        dataset_name='wikitext',
+        num_samples=512,      # More samples for better coverage
+        seq_len=512,          # Longer sequences
+        min_length=64,         # Ensure substantial sequences
+    )
+
+    calib_data_retnet = get_calibration_data(
+        tokenizer=tokenizer,
+        dataset_name='wikitext',
+        num_samples=512,      # More samples for better coverage
+        seq_len=512,          # Longer sequences
+        min_length=64,         # Ensure substantial sequences
+    )
+
+    calib_data_opt = get_calibration_data(
+        tokenizer=tokenizer,
+        dataset_name='wikitext',
+        num_samples=512,      # More samples for better coverage
+        seq_len=512,          # Longer sequences
+        min_length=64,         # Ensure substantial sequences
     )
     
     # Check 3: Verify calibration data
@@ -167,6 +293,36 @@ def quantize_gla_model(save_model: bool = True):
         calib_data=calib_data,
         batch_size=8,
         pad_token_id=tokenizer.pad_token_id,
+        device='cuda',
+        max_batches=None  # Use all batches
+    )
+    
+    print("\n" + "="*60)
+    print("Calibrating model6 (Mamba2)...")
+    print("="*60)
+    model6 = calibrate_static_quant(
+        model=model6,
+        calib_data=calib_data_mamba,
+        batch_size=8,
+        pad_token_id=tokenizer6.pad_token_id,
+        device='cuda',
+        max_batches=None  # Use all batches
+    )
+
+    model7 = calibrate_static_quant(
+        model=model7,
+        calib_data=calib_data_deltanet,
+        batch_size=8,
+        pad_token_id=tokenizer7.pad_token_id,
+        device='cuda',
+        max_batches=None  # Use all batches
+    )
+
+    model10 = calibrate_static_quant(
+        model=model10,
+        calib_data=calib_data_retnet,
+        batch_size=8,
+        pad_token_id=tokenizer10.pad_token_id,
         device='cuda',
         max_batches=None  # Use all batches
     )
@@ -515,11 +671,11 @@ def quantize_gla_model(save_model: bool = True):
     
     # Step 5: Convert to quantized (extract qparams, create int8 layers)
     print("\n" + "="*60)
-    print("Step 5: Converting to quantized model...")
+    print("Step 5: Converting to quantized model(s)...")
     print("="*60)
     try:
         model = convert_static_w8a8(model, target_dtype=torch.int8)
-        print("  ✓ Conversion successful!")
+        print("  ✓ GLA W8A8 conversion successful!")
     except Exception as e:
         print(f"  ✗ Conversion failed: {e}")
         print("\nDumping first observer state for debugging:")
@@ -531,6 +687,41 @@ def quantize_gla_model(save_model: bool = True):
                 break
         raise
     
+    try:
+        model6 = convert_static_w8a8(model6, target_dtype=torch.int8)
+        print("  ✓ Mamba2 W8A8 conversion successful!")
+    except Exception as e:
+        print(f"  ✗ Mamba2 conversion failed: {e}")
+        raise
+
+    try:
+        model7 = convert_static_w8a8(model7, target_dtype=torch.int8)
+        print("  ✓ DeltaNet W8A8 conversion successful!")
+    except Exception as e:
+        print(f"  ✗ DeltaNet conversion failed: {e}")
+        raise
+
+    try:
+        model10 = convert_static_w8a8(model10, target_dtype=torch.int8)
+        print("  ✓ RetNet W8A8 conversion successful!")
+    except Exception as e:
+        print(f"  ✗ RetNet conversion failed: {e}")
+        raise
+
+    group_sizes = [0, 128, 0, None, 0, None, 0, None]
+
+    model2 = convert_static_w8a16(model2, group_size=group_sizes[0], skip_gk_proj=False)
+    model3 = convert_static_w4a16(model3, group_size=group_sizes[1], skip_gk_proj=True)
+
+    model4 = convert_static_w8a16(model4, group_size=group_sizes[2], skip_gk_proj=False)
+    model5 = convert_static_w4a16(model5, group_size=group_sizes[3], skip_gk_proj=False)
+
+    model8 = convert_static_w8a16(model8, group_size=group_sizes[4], skip_gk_proj=False)
+    model9 = convert_static_w4a16(model9, group_size=group_sizes[5], skip_gk_proj=True)
+
+    model11 = convert_static_w8a16(model11, group_size=group_sizes[6], skip_gk_proj=False)
+    model12 = convert_static_w4a16(model12, group_size=group_sizes[7], skip_gk_proj=True)
+    
     # Step 6: Save quantized model (optional)
     if save_model:
         print("Step 6: Saving quantized model...")
@@ -540,17 +731,246 @@ def quantize_gla_model(save_model: bool = True):
             output_dir='pretrained_models/fla-hub',  # Save alongside original model
             model_name='gla_ptq-w8a8-1.3b',  # PTQ W8A8 quantized version
             model_type='gla',
+            quant_mode='w8a8',
             metadata={
                 'calibration_samples': 512,
                 'calibration_dataset': 'wikitext',
+                'calibration_seq_len': 512,
+                'calibration_min_len': 64,
                 'batch_size': 8,
                 'quantization_framework': 'torchao',
                 'quantization_method': 'PTQ',  # Post-Training Quantization
             }
         )
-        print(f"✓ Model saved to: {save_path}")
-    
+        print(f"✓ W8A8 quantized model saved to: {save_path}")
+
+        save_path2 = save_quantized_model(
+            model=model2,
+            tokenizer=tokenizer2,
+            output_dir='pretrained_models/fla-hub',
+            model_name='gla_ptq-w8a16-1.3b',
+            model_type='gla',
+            quant_mode='w8a16',
+            base_model_path='pretrained_models/fla-hub/gla-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'calibration_dataset': 'N/A',
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[0],  # Per-tensor quantization
+                'skip_gk_proj': False,  # gk_proj layers ARE quantized
+            }
+        )
+        print(f"✓ W8A16 quantized model saved to: {save_path2}")
+
+        save_path3 = save_quantized_model(
+            model=model3,
+            tokenizer=tokenizer3,
+            output_dir='pretrained_models/fla-hub',
+            model_name='gla_ptq-w4a16-1.3b',
+            model_type='gla',
+            quant_mode='w4a16',
+            base_model_path='pretrained_models/fla-hub/gla-1.3b',
+            metadata={
+                'calibration_samples': 512,
+                'calibration_dataset': 'wikitext',
+                'batch_size': 8,
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[1],
+                'skip_gk_proj': True,  # gk_proj layers ARE quantized
+            }
+        )
+
+        save_path4 = save_quantized_model(
+            model=model4,
+            tokenizer=tokenizer4,
+            output_dir='pretrained_models/state-spaces',
+            model_name='mamba2_ptq-w8a16-1.3b',
+            model_type='mamba2',
+            quant_mode='w8a16',
+            base_model_path='pretrained_models/state-spaces/mamba2-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[2],  # Per-tensor quantization
+                'skip_gk_proj': False,  # N/A for Mamba2 (no gk_proj)
+            }
+        )
+        print(f"✓ Mamba2 W8A16 quantized model saved to: {save_path4}")
+
+        save_path5 = save_quantized_model(
+            model=model5,
+            tokenizer=tokenizer5,
+            output_dir='pretrained_models/state-spaces',
+            model_name='mamba2_ptq-w4a16-1.3b',
+            model_type='mamba2',
+            quant_mode='w4a16',
+            base_model_path='pretrained_models/state-spaces/mamba2-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[3],
+                'skip_gk_proj': False,  # N/A for Mamba2 (no gk_proj)
+            }
+        )
+        print(f"✓ Mamba2 W4A16 quantized model saved to: {save_path5}")
+        
+        save_path6 = save_quantized_model(
+            model=model6,
+            tokenizer=tokenizer6,
+            output_dir='pretrained_models/state-spaces',
+            model_name='mamba2_ptq-w8a8-1.3b',
+            model_type='mamba2',
+            quant_mode='w8a8',
+            metadata={
+                'calibration_samples': 512,
+                'calibration_dataset': 'wikitext',
+                'calibration_seq_len': 512,
+                'calibration_min_len': 64,
+                'batch_size': 8,
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+            }
+        )
+        print(f"✓ Mamba2 W8A8 quantized model saved to: {save_path6}")
+
+        save_path7 = save_quantized_model(
+            model=model7,
+            tokenizer=tokenizer7,
+            output_dir='pretrained_models/fla-hub',
+            model_name='delta_net_ptq-w8a8-1.3b',
+            model_type='delta_net',
+            quant_mode='w8a8',
+            metadata={
+                'calibration_samples': 512,
+                'calibration_dataset': 'wikitext',
+                'calibration_seq_len': 512,
+                'calibration_min_len': 64,
+                'batch_size': 8,
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+            }
+        )
+        print(f"✓ DeltaNet W8A8 quantized model saved to: {save_path7}")
+
+        save_path8 = save_quantized_model(
+            model=model8,
+            tokenizer=tokenizer8,
+            output_dir='pretrained_models/fla-hub',
+            model_name='delta_net_ptq-w8a16-1.3b',
+            model_type='delta_net',
+            quant_mode='w8a16',
+            base_model_path='pretrained_models/fla-hub/delta_net-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[4],  # Per-tensor quantization
+                'skip_gk_proj': False,  # N/A for DeltaNet (no gk_proj)
+            }
+        )
+        print(f"✓ DeltaNet W8A16 quantized model saved to: {save_path8}")
+
+        save_path9 = save_quantized_model(
+            model=model9,
+            tokenizer=tokenizer9,
+            output_dir='pretrained_models/fla-hub',
+            model_name='delta_net_ptq-w4a16-1.3b',
+            model_type='delta_net',
+            quant_mode='w4a16',
+            base_model_path='pretrained_models/fla-hub/delta_net-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[5],  # Per-tensor quantization
+                'skip_gk_proj': True,  # N/A for DeltaNet (no gk_proj)
+            }
+        )
+        print(f"✓ DeltaNet W4A16 quantized model saved to: {save_path9}")
+
+        save_path10 = save_quantized_model(
+            model=model10,
+            tokenizer=tokenizer10,
+            output_dir='pretrained_models/fla-hub',
+            model_name='retnet_ptq-w8a8-1.3b',
+            model_type='retnet',
+            quant_mode='w8a8',
+            metadata={
+                'calibration_samples': 512,
+                'calibration_dataset': 'wikitext',
+                'calibration_seq_len': 512,
+                'calibration_min_len': 64,
+                'batch_size': 8,
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+            }
+        )
+        print(f"✓ RetNet W8A8 quantized model saved to: {save_path10}")
+
+        save_path11 = save_quantized_model(
+            model=model11,
+            tokenizer=tokenizer11,
+            output_dir='pretrained_models/fla-hub',
+            model_name='retnet_ptq-w8a16-1.3b',
+            model_type='retnet',
+            quant_mode='w8a16',
+            base_model_path='pretrained_models/fla-hub/retnet-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[6],  # Per-tensor quantization
+                'skip_gk_proj': False,  # N/A for RetNet (no gk_proj)
+            }
+        )
+        print(f"✓ RetNet W8A16 quantized model saved to: {save_path11}")
+
+        save_path12 = save_quantized_model(
+            model=model12,
+            tokenizer=tokenizer12,
+            output_dir='pretrained_models/fla-hub',
+            model_name='retnet_ptq-w4a16-1.3b',
+            model_type='retnet',
+            quant_mode='w4a16',
+            base_model_path='pretrained_models/fla-hub/retnet-1.3b',
+            metadata={
+                'calibration_samples': 0,  # Weight-only, no calibration needed
+                'quantization_framework': 'torchao',
+                'quantization_method': 'PTQ',
+                'group_size': group_sizes[7],  # Per-tensor quantization
+                'skip_gk_proj': True,  # N/A for RetNet (no gk_proj)
+            }
+        )
+        print(f"✓ RetNet W4A16 quantized model saved to: {save_path12}")
+
+
     print("\n✅ Quantization complete!")
+    print("\n" + "="*60)
+    print("HOW TO USE THE QUANTIZED MODELS:")
+    print("="*60)
+    print("1. W8A8 models can be loaded normally with:")
+    print("   model = AutoModelForCausalLM.from_pretrained('pretrained_models/fla-hub/gla_ptq-w8a8-1.3b')")
+    print("")
+    print("2. W8A16 and W4A16 (weight-only) models require special loading:")
+    print("   from torchao_baseline.utils_torchao import load_weight_only_quantized_model")
+    print("   model = load_weight_only_quantized_model('pretrained_models/fla-hub/gla_ptq-w8a16-1.3b')")
+    print("")
+    print("3. To evaluate with main.py:")
+    print("   # GLA models (use model_type 'gla_ptq'):")
+    print("   python main.py --model gla_ptq-w8a8-1.3b --pretrained_dir pretrained_models/fla-hub \\")
+    print("       --task_list lambada_openai,hellaswag --eval_zero_shot")
+    print("")
+    print("   # Mamba2 models (use model_type 'mamba2_ptq'):")
+    print("   python main.py --model mamba2_ptq-w8a8-1.3b --pretrained_dir pretrained_models/state-spaces \\")
+    print("       --task_list lambada_openai,hellaswag --eval_zero_shot")
+    print("")
+    print("   # For weight-only models (W8A16/W4A16), they'll auto-load via custom loader")
+    print("="*60 + "\n")
+    
     return model, tokenizer
 
 
@@ -605,6 +1025,117 @@ def test_quantized_model(model, tokenizer):
     print(f"  Embedding output: type={type(embed_out).__name__}, dtype={embed_out.dtype}, shape={embed_out.shape}")
     print(f"  Embedding has NaN: {torch.isnan(embed_out).any()}")
     print(f"  Embedding min/max: {embed_out.min().item():.4f} / {embed_out.max().item():.4f}")
+    
+    # NEW: Verify tensor types inside QuantizedLinear forward pass
+    print("\n[DIAGNOSTIC] Verifying AffineQuantizedTensor usage in forward pass...")
+    # Get first QuantizedLinear layer
+    first_quant_layer = None
+    first_quant_name = None
+    for name, module in model.named_modules():
+        if isinstance(module, QuantizedLinear):
+            first_quant_layer = module
+            first_quant_name = name
+            break
+    
+    if first_quant_layer:
+        print(f"  Testing layer: {first_quant_name}")
+        
+        # Create a test input
+        test_input = torch.randn(1, 10, first_quant_layer.qweight.shape[1]).cuda()
+        
+        # Monkey-patch the forward to capture intermediate tensors
+        captured_tensors = {}
+        original_forward = first_quant_layer.forward
+        
+        def instrumented_forward(x):
+            # Capture input
+            captured_tensors['input'] = x
+            captured_tensors['input_type'] = type(x)
+            
+            # Ensure input is plain float tensor
+            if hasattr(x, 'dequantize'):
+                x = x.dequantize()
+            if type(x) != torch.Tensor:
+                x = x.detach().clone()
+            
+            # Quantize activations
+            block_size = x.shape
+            from torchao.dtypes import to_affine_quantized_intx_static
+            qx = to_affine_quantized_intx_static(
+                x,
+                first_quant_layer.act_scale,
+                first_quant_layer.act_zero_point,
+                block_size,
+                first_quant_layer.target_dtype,
+            )
+            
+            captured_tensors['qx'] = qx
+            captured_tensors['qx_type'] = type(qx)
+            captured_tensors['qx_type_name'] = type(qx).__name__
+            captured_tensors['qweight_type'] = type(first_quant_layer.qweight)
+            captured_tensors['qweight_type_name'] = type(first_quant_layer.qweight).__name__
+            
+            # Int8 x int8 matmul
+            import torch.nn.functional as F
+            output = F.linear(qx, first_quant_layer.qweight, first_quant_layer.bias)
+            
+            captured_tensors['output_before_dequant'] = output
+            captured_tensors['output_before_dequant_type'] = type(output)
+            captured_tensors['output_before_dequant_type_name'] = type(output).__name__
+            
+            # Dequantize output
+            if hasattr(output, 'dequantize'):
+                output = output.dequantize()
+            
+            if type(output) != torch.Tensor:
+                output = output.detach().clone().contiguous()
+            else:
+                output = output.contiguous()
+            
+            captured_tensors['output_after_dequant'] = output
+            captured_tensors['output_after_dequant_type'] = type(output)
+            
+            return output
+        
+        # Run instrumented forward
+        first_quant_layer.forward = instrumented_forward
+        with torch.no_grad():
+            _ = first_quant_layer(test_input)
+        first_quant_layer.forward = original_forward
+        
+        # Report findings
+        print(f"\n  Input tensor:")
+        print(f"    Type: {captured_tensors['input_type']}")
+        print(f"    Is plain torch.Tensor: {captured_tensors['input_type'] == torch.Tensor}")
+        
+        print(f"\n  Quantized activation (qx):")
+        print(f"    Type: {captured_tensors['qx_type_name']}")
+        print(f"    Is AffineQuantizedTensor: {'AffineQuantizedTensor' in captured_tensors['qx_type_name']}")
+        print(f"    Full type: {captured_tensors['qx_type']}")
+        
+        print(f"\n  Quantized weight (qweight):")
+        print(f"    Type: {captured_tensors['qweight_type_name']}")
+        print(f"    Is AffineQuantizedTensor: {'AffineQuantizedTensor' in captured_tensors['qweight_type_name']}")
+        print(f"    Full type: {captured_tensors['qweight_type']}")
+        
+        print(f"\n  Output BEFORE dequantization:")
+        print(f"    Type: {captured_tensors['output_before_dequant_type_name']}")
+        print(f"    Is AffineQuantizedTensor: {'AffineQuantizedTensor' in captured_tensors['output_before_dequant_type_name']}")
+        print(f"    Full type: {captured_tensors['output_before_dequant_type']}")
+        
+        print(f"\n  Output AFTER dequantization:")
+        print(f"    Type: {captured_tensors['output_after_dequant_type']}")
+        print(f"    Is plain torch.Tensor: {captured_tensors['output_after_dequant_type'] == torch.Tensor}")
+        
+        # Verify this is actually INT8 x INT8
+        if 'AffineQuantizedTensor' in captured_tensors['qx_type_name'] and 'AffineQuantizedTensor' in captured_tensors['qweight_type_name']:
+            print(f"\n  ✅ CONFIRMED: Forward pass uses AffineQuantizedTensor")
+            print(f"     This IS genuine W8A8 quantization (INT8 x INT8 matmul)")
+        else:
+            print(f"\n  ⚠️  WARNING: Expected AffineQuantizedTensor but got different types!")
+            print(f"     This might NOT be genuine W8A8 quantization")
+    else:
+        print("  ✗ No QuantizedLinear layers found!")
     
     # CRITICAL: Test if unquantized FP32 model works AND measure memory
     print("\n[DIAGNOSTIC] Loading FP32 model to verify it works...")
