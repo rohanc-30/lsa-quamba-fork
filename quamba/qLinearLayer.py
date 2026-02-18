@@ -262,7 +262,7 @@ class W4A8B16O16Linear(torch.nn.Module):
     def forward(self, x):
         assert not torch.isnan(self.input_scale).any(), "input_scale has NaN"
         assert not torch.isnan(self.weight).any(), "weight has NaN"
-        print('passed init forward checks!')
+        # print('passed init forward checks!')
         x_shape = x.shape
         # this contiguous is necessary for batch size > 1 for lm_head
         # https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L281
@@ -280,7 +280,7 @@ class W4A8B16O16Linear(torch.nn.Module):
             False           # transpose output
         )
         assert not torch.isnan(y).any(), "y has NaN"
-        print('passed forward checks!')
+        # print('passed forward checks!')
         if self.pad_out != 0:
             y = y[:, 0:-self.pad_out]
         y = y.view(*x_shape[:-1], -1) # [B*L, D] -> [B, L, D]

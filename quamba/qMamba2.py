@@ -379,7 +379,6 @@ class Mamba2Simple(nn.Module):
 
 
 class W4A16QMamba2(nn.Module):
-
     def __init__(
         self,
         d_model,

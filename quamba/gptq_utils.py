@@ -3,12 +3,22 @@ This file is a modified version of the original file from the GPTQ repo.
 https://github.com/IST-DASLab/gptq
 """
 import math
+# from tarfile import _Bz2ReadableFileobj
 import time
 import gc
+from unittest import BaseTestSuite
+
+import matplotlib.pyplot as plt
+
+import os
 
 import torch
 import torch.nn as nn
 import transformers
+from torch.autograd.functional import jacobian
+import numpy as np
+
+from safetensors.torch import load_file, save_file
 
 from quamba.qLinearLayer import HadLinear
 from quamba.datatype_utils import fake_quantize_with_type, get_datatypes, get_type_scales, get_quant_value_from_dtype_lists
@@ -102,7 +112,31 @@ class GPTQ:
         self.nsamples = 0 
         del W
 
+    ### Need to modify this hook for SM-GPTQ -- have to either calculate J online or redo to calculate J offline
+    ### J is the derivative of the mixer output with respect to the activations/inputs
+    ### 2J^TJ is the new Hessian of the mixer output with respect to the activations/inputs; H after being calculated is used the same as in GPTQ
+    ### Math work to do: verify 2J^TJ is is actually H, reading Gauss-Newton if you have to
+    ### Engineering work to do: determine if hook can materialize J online
+    ### Side quests: work on understanding activation rearrangement, extend quantization to OPT
+    ### Questions: does SM-GPTQ look like normal GPTQ for out_proj?
     def add_batch(self, inp, out):
+        '''
+        print(torch.cuda.get_device_name())
+        print("Total VRAM (GB):", torch.cuda.get_device_properties(0).total_memory / 1e9)
+
+        print()
+        print(inp.shape)
+        print(self.layer.weight.shape)
+        print(out.shape)
+        print()
+        '''
+        
+
+
+        # Out-channel 0 jacobian
+
+        # raise ValueError
+
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0] 
@@ -190,5 +224,412 @@ class GPTQ:
 
     def free(self):
         self.H = None
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+# implement GPTQ with a different J matrix
+class SMGPTQ():
+    def __init__(self, layer, idx=0):
+        self.idx = idx
+
+        # print(self.idx)
+
+        # print(layer)
+        self.layer = layer
+        self.dev = self.layer.in_proj.weight.device
+        # HY: To save memory, we use float16 to compute distances for non-uniform quantization
+        #     see datatype_utils.py for def fake_quantize_with_type 
+        self.gptq_dtype = torch.float16
+        
+        # print(self.layer.in_proj.weight.shape)
+        # print(self.layer.out_proj.weight.shape)
+
+        self.out_dim = self.layer.out_proj.weight.shape[1] # channels after mixer, before out_proj
+        self.in_dim = self.layer.in_proj.weight.shape[0] # channels after in_proj
+        # print(self.out_dim)
+        # print(self.in_dim)
+
+        print("headdim: ", self.layer.headdim)
+        print("ngroups: ", self.layer.ngroups)
+        print("d_state: ", self.layer.d_state)
+        print("d_inner: ", self.layer.d_inner)
+        print("nheads: ", self.layer.nheads)
+        print("expansion factor: ", self.layer.expand)
+        print("d_ssm: ", self.layer.d_ssm)
+        print("d_model: ", self.layer.d_model)
+        print()
+
+    # How do we take derivative of out with respect to the WEIGHT of the layer (self.layer.weight)?
+    # Store this derivative in J
+    # That is, J = d(out)/d(self.layer.weight)
+    def capture_inputs(self, inp, out):
+        # print(inp.shape)
+        # print(out.shape)
+        # print(self.layer)
+        # print()
+        self.inputs = inp
+
+    def capture_outputs(self, x, z, out):
+        print(x.shape)
+        print(z.shape)
+        print(out.shape)
+        print(self.layer)
+        # print(self.layer.__dict__)
+        # print()
+        # sum over batch dimension
+        inp = x * torch.nn.functional.silu(z)
+        self.pre_outputs = inp.sum(dim=0).unsqueeze(0)
+
+        # Cut to half the size
+        self.pre_outputs = self.pre_outputs[:, :self.pre_outputs.shape[1]//2]
+    
+    def compute_jacobian_sampled(self):
+        if self.idx != 1:
+        # if self.idx != 23:
+            print("skipping layer\n")
+            return
+        # print(self.inputs.shape)
+        # print(self.pre_outputs.shape)
+
+        # Split fused W into individual weight matrices as per mamba2
+        W_z = self.layer.in_proj.weight[:self.layer.d_inner, :]
+        W_x = self.layer.in_proj.weight[self.layer.d_inner:2 * self.layer.d_inner, :]
+        W_b = self.layer.in_proj.weight[2 * self.layer.d_inner:2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state, :]
+        W_c = self.layer.in_proj.weight[2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state:2 * self.layer.d_inner + 2 * self.layer.ngroups * self.layer.d_state, :]
+        W_t = self.layer.in_proj.weight[-self.layer.nheads:, :]
+
+        # print(W_z.shape, W_x.shape, W_b.shape, W_c.shape, W_t.shape)
+        # print()
+
+        sample_channel_count = 16
+        sample_temporal_count = self.pre_outputs.shape[1]
+
+        sample_param_count = 4
+        sample_input_count = 4
+
+        # Randomly sample all dimensions
+        rand_channel = np.arange(sample_channel_count)
+        rand_temporal = np.arange(sample_temporal_count)
+
+        # rand_channel += 64
+
+        rand_param = np.arange(sample_param_count) + 8192
+        rand_input = np.arange(sample_input_count)
+
+        # Code to compute entire Jacobian for sampled outputs.
+
+        # print(self.pre_outputs.shape)
+        #print(self.pre_outputs[0, :sample_temporal_count, :sample_channel_count])
+
+        rand_channel = np.array([0, 4, 8, 12, 16, 20, 24, 28, 35, 39, 43, 47, 51, 55, 59, 63])
+        rand_channel = np.array([0, 9, 18, 27, 36, 45, 54, 63])
+        heads = self.layer.headdim*np.arange(self.layer.nheads)
+        print(heads)
+        rand_channel = np.add.outer(heads, rand_channel).transpose().flatten()
+        print(rand_channel)
+        
+        t0 = time.time()
+        z_shards = {}
+        x_shards = {}
+        b_shards = {}
+        c_shards = {}
+        J_z = []
+        J_x = []
+        J_b = []
+        J_c = []
+        J = []
+        t0 = time.time()
+        for i in range(len(rand_channel)):
+            # iterate over L dimension
+            z_channel = rand_channel[i]
+            x_channel = rand_channel[i] + W_z.shape[0]
+
+            # Create lists for query-key channels. Hardcode expansion factor of 2 for now.
+            expansion_factor = self.layer.d_state/self.layer.headdim
+            head_location = rand_channel[i] % (self.layer.headdim)
+            b_channel_start = W_z.shape[0] + W_x.shape[0] + head_location
+            c_channel_start = W_z.shape[0] + W_x.shape[0] + W_b.shape[0] + head_location
+            b_channel = np.arange(b_channel_start, b_channel_start + expansion_factor)
+            c_channel = np.arange(c_channel_start, c_channel_start + expansion_factor)
+
+            print(rand_channel[i])
+            print(z_channel)
+            print(x_channel)
+            print(b_channel)
+            print(c_channel)
+            # sprint()
+
+            J_z.append([])
+            J_x.append([])
+            J_b.append([])
+            J_c.append([])
+
+            t0 = time.time()
+
+            for l in range(len(rand_temporal)):
+                # tensor_key = f"L{self.idx}_C{rand_channel[i]}_T{rand_temporal[l]}"
+                # print(tensor_key)
+
+                gW, = torch.autograd.grad(self.pre_outputs[0, rand_temporal[l], rand_channel[i]], self.layer.in_proj.weight, retain_graph=True)
+                # shard_data[tensor_key] = gW.detach().cpu()
+
+                # print(gW.shape)
+                # J.append(gW.detach().cpu()[rand_param, :][:, rand_input])
+                relevant_activations = gW.nonzero()[:, 0].unique()
+
+                J_z[-1].append(gW.detach().cpu()[z_channel, :])
+                J_x[-1].append(gW.detach().cpu()[x_channel, :])
+                J_b[-1].append(gW.detach().cpu()[b_channel, :])
+                J_c[-1].append(gW.detach().cpu()[c_channel, :])
+                '''
+                b = False
+                if relevant_activations.shape[0] != 259:
+                    b = True
+                    print(f"Channel {rand_channel[i]}, Temporal {rand_temporal[l]}")
+                    print("Size mismatch: ", relevant_activations.shape[0], "!= 259")
+                first_element = relevant_activations[0].item()
+                expected_first_element = rand_channel[i]
+                if first_element != expected_first_element:
+                    if not b:
+                        print(f"Channel {rand_channel[i]}, Temporal {rand_temporal[l]}")
+                    print(f"First element mismatch: {first_element} != {expected_first_element}")
+                    b = True
+                second_element = relevant_activations[1].item()
+                expected_second_element = 4096 + rand_channel[i]
+                if second_element != expected_second_element:
+                    if not b:
+                        print(f"Channel {rand_channel[i]}, Temporal {rand_temporal[l]}")
+                    print(f"First element mismatch: {second_element} != {expected_second_element}")
+                    b = True
+                last_element = relevant_activations[-1].item()
+                expected_last_element = 8448 + (rand_channel[i] // 64)
+                if last_element != expected_last_element:
+                    if not b:
+                        print(f"Channel {rand_channel[i]}, Temporal {rand_temporal[l]}")
+                    print(f"Last element mismatch: {last_element} != {expected_last_element}")
+                    b = True
+                third_element = relevant_activations[2].item()
+                expected_third_element_minimum = 8192
+                if third_element < expected_third_element_minimum:
+                    if not b:
+                        print(f"Channel {rand_channel[i]}, Temporal {rand_temporal[l]}")
+                    print(f"Second element mismatch: {third_element} < {expected_third_element_minimum}")
+                    b = True
+                if b:
+                    print()
+                '''
+
+                
+            # print("Channel {rand_channel[i]} time: ", time.time() - t0)
+            J_z[-1] = torch.stack(J_z[-1])
+            J_x[-1] = torch.stack(J_x[-1])
+            J_b[-1] = torch.stack(J_b[-1])
+            J_c[-1] = torch.stack(J_c[-1])
+            # print(J_z[-1].shape)
+            # print(J_x[-1].shape)
+            # print(J_b[-1].shape)
+            # print(J_c[-1].shape)
+            print(time.time() - t0)
+            print()
+
+            z_shards[str(rand_channel[i])] = J_z[-1]
+            x_shards[str(rand_channel[i])] = J_x[-1]
+            b_shards[str(rand_channel[i])] = J_b[-1]
+            c_shards[str(rand_channel[i])] = J_c[-1]
+
+            '''
+            if rand_channel[i] > self.layer.nheads * 2:
+                print("z_shards:")
+                for key, value in z_shards.items():
+                    print(key, value.shape)
+                print()
+                print("x_shards:")
+                for key, value in x_shards.items():
+                    print(key, value.shape)
+                print()
+                print("b_shards:")
+                for key, value in b_shards.items():
+                    print(key, value.shape)
+                print()
+                print("c_shards:")
+                for key, value in c_shards.items():
+                    print(key, value.shape)
+                print()
+                raise ValueError("Balls!!")
+            '''
+        
+        path = f'../jacobian_block_samples/130m/layer{self.idx}'
+        os.makedirs(path, exist_ok=True)
+        zpath = os.path.join(path, f"z.safetensors")
+        save_file(z_shards, zpath)
+        xpath = os.path.join(path, f"x.safetensors")
+        save_file(x_shards, xpath)
+        bpath = os.path.join(path, f"b.safetensors")
+        save_file(b_shards, bpath)
+        cpath = os.path.join(path, f"c.safetensors")
+        save_file(c_shards, cpath)
+
+        raise ValueError(f"Saved tensors in layer {self.idx}!")
+        
+        J = torch.stack(J)
+        print(J.shape)
+
+        #J_filt = J[:, rand_param, :][:, :, rand_input]
+        #J_filt = J_filt.reshape(J_filt.shape[0], -1)
+        #print(J_filt.shape)
+
+        J = J.reshape(J.shape[0], -1)
+
+        print(J)
+
+        H_raw = J.t() @ J
+        print(H_raw.shape)
+        print(H_raw)
+
+
+        # Build probes for JVP -- they should be dotted with outputs, so dimension is same as self.pre_outputs
+        max_probes = 1024
+        print(self.pre_outputs.shape)
+        probes = torch.randn(max_probes, self.pre_outputs.shape[1], self.pre_outputs.shape[2], device=self.dev)
+        probes_rademacher = (torch.randint(0, 2, (max_probes, self.pre_outputs.shape[1], self.pre_outputs.shape[2]), device=self.dev)) * 2 - 1
+
+        # probes = probes_rademacher
+
+        # dot product of probes and J_filt, batched across probes
+        JVP_scalars = (probes.reshape(max_probes, -1) * self.pre_outputs.reshape(-1)).sum(dim=1)
+        print(JVP_scalars.shape)
+
+        t0 = time.time()
+        # get gradients of JVP_scalars with respect to self.layer.in_proj.weight
+        Gs = []
+        for i in range(max_probes):
+            gi_full, = torch.autograd.grad(
+                outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
+                retain_graph=True,
+                create_graph=False,
+            )
+            Gs.append(gi_full[rand_param, :][:, rand_input])
+
+        G = torch.stack(Gs, dim=0)
+        print(G.shape) 
+
+        G = G.reshape(G.shape[0], -1).double()
+        print(time.time() - t0)
+
+        '''
+        H_individual = torch.bmm(G.transpose(1, 2), G)
+        print(H_individual.shape)
+        '''
+
+        print(G[:8].t())
+        print(G[:8])
+
+        H_est_8 = (G[:8].t()/8 @ G[:8])
+        H_est_16 = (G[:16].t()/16 @ G[:16])
+        H_est_32 = (G[:32].t()/32 @ G[:32])
+        H_est_64 = (G[:64].t()/64 @ G[:64])
+        H_est_128 = (G[:128].t()/128 @ G[:128])
+        H_est_256 = (G[:256].t()/256 @ G[:256])
+        H_est_512 = (G[:512].t()/512 @ G[:512])
+        H_est_full = (G.t()/max_probes @ G)
+
+        H_estimate_list = [H_est_8, H_est_16, H_est_32, H_est_64, H_est_128, H_est_256, H_est_512, H_est_full, H_raw]
+
+        fro_norm_error_percents = []
+        diagonal_error_percents = []
+        fro_norm_error_percents_ref = []
+        diagonal_error_percents_ref = []
+
+        probe_counts = [8, 16, 32, 64, 128, 256, 512, max_probes]
+        log_probe_counts = [math.log2(x) for x in probe_counts]
+
+        '''
+        for H in H_estimate_list: 
+            # print(H)
+            print(((H.to(H_raw.device) - H_raw).abs()).mean()) 
+        '''   
+
+        for i, H in enumerate(H_estimate_list):  
+            if i == len(H_estimate_list) - 1:
+                break
+            samples_used = 2 ** (i+3)
+            if i == 0:
+                print(f"Using {samples_used} samples")
+                # print(H)
+            else:
+                print(f"Using {samples_used} samples")
+                # print(H)
+                error = (H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs()
+                error_ref = (H.to(H_estimate_list[-2].device) - H_estimate_list[-2]).abs()
+                fro_norm_prior = torch.linalg.norm(H_estimate_list[i-1])
+                fro_norm_current = torch.linalg.norm(H)
+                fro_norm_error = torch.linalg.norm(error)
+                fro_norm_error_ref = torch.linalg.norm(error_ref)
+                fro_norm_ref = torch.linalg.norm(H_estimate_list[-2])
+
+                diagonal_error_norm = torch.linalg.norm(error.diag())
+                diagonal_prior_norm = torch.linalg.norm(H_estimate_list[i-1].diag())
+                diagonal_current_norm = torch.linalg.norm(H.diag())
+                diagonal_ref_norm = torch.linalg.norm(H_estimate_list[-2].diag())
+                diagonal_error_norm_ref = torch.linalg.norm(error_ref.diag())
+
+
+                print(100*fro_norm_error/fro_norm_prior)
+                print(100*diagonal_error_norm/diagonal_prior_norm)
+                print(100*fro_norm_error_ref/fro_norm_ref)
+                print(100*diagonal_error_norm_ref/diagonal_ref_norm)
+
+                fro_norm_error_percents.append((100*fro_norm_error/fro_norm_prior).item())
+                diagonal_error_percents.append((100*diagonal_error_norm/diagonal_prior_norm).item())
+                fro_norm_error_percents_ref.append((100*fro_norm_error_ref/fro_norm_ref).item())
+                diagonal_error_percents_ref.append((100*diagonal_error_norm_ref/diagonal_ref_norm).item())
+                # print(100*(((H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs())/H_estimate_list[i-1]))
+                # print(100*(((H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs())/H_estimate_list[i-1]).median())
+            print()
+            print()    
+
+        # pass
+
+        # Create plots
+        plt.plot(log_probe_counts[1:], fro_norm_error_percents, label='||H(P) - H(P/2)||/||H(P/2)||')
+        plt.plot(log_probe_counts[1:], diagonal_error_percents, label='||Diag(H(P) - H(P/2))||/||Diag(H(P/2))||')
+        plt.plot(log_probe_counts[1:], fro_norm_error_percents_ref, label='||H(P) - H(1024)||/||H(1024)||')
+        plt.plot(log_probe_counts[1:], diagonal_error_percents_ref, label='||Diag(H(P) - H(P/2))||/||Diag(H(1024))||')
+        plt.xlabel('Log2(Probe Count P)')
+        plt.ylabel('Error Percentage')
+        plt.title('Error vs. Log Probe Count P')
+        plt.legend()
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_1.3b_Layer_{self.idx}_Log.png")
+        # clear plot
+        plt.clf()
+
+        plt.plot(probe_counts[1:], fro_norm_error_percents, label='||H(P) - H(P/2)||/||H(P/2)||')
+        plt.plot(probe_counts[1:], diagonal_error_percents, label='||Diag(H(P) - H(P/2))||/||Diag(H(P/2))||')
+        plt.plot(probe_counts[1:], fro_norm_error_percents_ref, label='||H(P) - H(1024)||/||H(1024)||')
+        plt.plot(probe_counts[1:], diagonal_error_percents_ref, label='||Diag(H(P) - H(P/2))||/||Diag(H(1024))||')
+        plt.xlabel('Probe Count P')
+        plt.ylabel('Error Percentage')
+        plt.title('Error vs. Probe Count P')
+        plt.legend()
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_Identity.png")
+
+
+        raise ValueError(f"Layer {self.idx} over!")
+        
+        '''
+        file_path = os.path.join("jacobian_samples", f"Layer_{self.idx}.safetensors")
+        save_file(shard_data, file_path)
+        print(f"Saved shard data for layer {self.idx} to {file_path}")
+        print(f"Used temporal dimensions: {rand_temporal}")
+        print(f"Used channel dimensions: {rand_channel}")
+        print()
+        '''
+        raise ValueError(f"Layer {self.idx} over!")
+        del shard_data
+    
+    def free(self):
         torch.cuda.empty_cache()
         gc.collect()

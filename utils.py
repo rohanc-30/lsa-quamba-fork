@@ -223,6 +223,10 @@ def get_quantize_options(parser):
         help='Whether to apply the GPTQ quantizer (default: False)'
     )
     parser.add_argument(
+        '--use_hadamard_transform', action='store_true', default=False,
+        help='Whether to use the hadamard transform (default: False)'
+    )
+    parser.add_argument(
         '--w_bits', type=int, default=8,
         help='The bit-width for weights applied in the real quantization (default: 8)'
     )

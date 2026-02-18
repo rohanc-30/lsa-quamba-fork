@@ -2,6 +2,8 @@
 
 MODEL=$1
 PRECISION=$2
+APPLY_GPTQ=$3
+USE_HADAMARD_TRANSFORM=$4
 
 if [[ -z "$MODEL" ]]; then
   echo "Usage: $0 <model> [precision]"
@@ -17,6 +19,13 @@ if [[ -z "$PRECISION" && "$MODEL" != *"quamba"* ]]; then
   exit 1
 fi
 
+if [[ -z "$APPLY_GPTQ" ]]; then
+  APPLY_GPTQ=false
+fi
+
+if [[ -z "$USE_HADAMARD_TRANSFORM" ]]; then
+  USE_HADAMARD_TRANSFORM=false
+fi
 
 CMD="python main.py $MODEL --batch_size 16 --eval_zero_shot --pretrained_dir ./pretrained_models --log_dir ./logs"
 
@@ -34,16 +43,24 @@ if [[ "$MODEL" != *"quamba"* ]]; then
         CMD+=" --quantize --quantize_embedding --quantize_lm_head"
         ;;
     w4a8)
-        CMD+=" --quantize --w_bits 4 --a_bits 8 --apply_gptq --quantize_embedding --quantize_lm_head"
+        CMD+=" --quantize --w_bits 4 --a_bits 8 --quantize_embedding --quantize_lm_head"
         ;;
     w4a16)
-        CMD+=" --quantize --w_bits 4 --a_bits 16 --apply_gptq"
+        CMD+=" --quantize --w_bits 4 --a_bits 16 --quantize_embedding --quantize_lm_head"
         ;;
     *)
         echo "Unsupported precision: $PRECISION"
         exit 1
         ;;
     esac
+fi
+
+if [[ "$APPLY_GPTQ" == "true" ]]; then
+  CMD+=" --apply_gptq"
+fi
+
+if [[ "$USE_HADAMARD_TRANSFORM" == "true" ]]; then
+  CMD+=" --use_hadamard_transform"
 fi
 
 echo "Running: $CMD"

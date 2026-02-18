@@ -370,7 +370,13 @@ class W4A16QGLA(nn.Module):
         # # DEBUG: Check attention output  # DEBUG
         if torch.isnan(o).any() or torch.isinf(o).any():  # DEBUG
             logging.error(f"❌ W4A16QGLA: NaN/Inf in attention output O!")  # DEBUG
-            # raise ValueError("NaN produced by attention kernel (chunk_gla/fused_recurrent_gla)")  # DEBUG
+            # Write tensors to files in special directory
+            torch.save(o, "debug_tensors/o.pt")
+            torch.save(q, "debug_tensors/q.pt")
+            torch.save(k, "debug_tensors/k.pt")
+            torch.save(v, "debug_tensors/v.pt")
+            torch.save(gk, "debug_tensors/gk.pt")
+            raise ValueError("NaN produced by attention kernel (chunk_gla/fused_recurrent_gla)")  # DEBUG
         
         if hasattr(self, 'g_proj'):
             g = self.g_proj(hidden_states.half())
