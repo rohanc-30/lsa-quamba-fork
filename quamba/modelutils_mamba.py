@@ -853,7 +853,7 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         
         for name in gptq_sm.keys():
             logging.debug(f"Calculating Jacobian for layer.{i}.mixer.{name} with {bits} bits")
-            gptq_sm[name].compute_jacobian_sampled()
+            gptq_sm[name].read_and_compare()
             gptq_sm[name].free()
         del gptq_sm
         

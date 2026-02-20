@@ -285,7 +285,7 @@ class SMGPTQ():
         self.pre_outputs = self.pre_outputs[:, :self.pre_outputs.shape[1]//2]
     
     def compute_jacobian_sampled(self):
-        if self.idx != 1:
+        if self.idx != 13:
         # if self.idx != 23:
             print("skipping layer\n")
             return
@@ -629,6 +629,239 @@ class SMGPTQ():
         '''
         raise ValueError(f"Layer {self.idx} over!")
         del shard_data
+    
+    def read_shards(self):
+        path = f'../jacobian_block_samples/130m/layer{self.idx}'
+        zpath = os.path.join(path, f"z.safetensors")
+        xpath = os.path.join(path, f"x.safetensors")
+        bpath = os.path.join(path, f"b.safetensors")
+        cpath = os.path.join(path, f"c.safetensors")
+        z_shards = load_file(zpath)
+        x_shards = load_file(xpath)
+        b_shards = load_file(bpath)
+        c_shards = load_file(cpath)
+        return z_shards, x_shards, b_shards, c_shards
+    
+    def int_keys(self, tensor_shard):
+        final_shard = {}
+        for key, value in tensor_shard.items():
+            final_shard[int(key)] = value / self.inputs.shape[0] # divide by batch size to get average instead of sum
+        return final_shard
+
+    def convert_to_hessian(self, tensor_shard):
+        hessian_shard = {}
+        for key, value in tensor_shard.items():
+            # print(value)
+            if len(value.shape) > 2:
+                value = value.reshape(value.shape[0], -1)
+            # print(value)
+            hessian_shard[key] = value.t() @ value
+            print(key, hessian_shard[key].shape)
+        print()
+        return hessian_shard
+    
+    def jvp_gradients(self, max_probes, tensor_shard):
+        # implement JVPs
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # JVP is the Jacobian-Vector Product
+        # JVP = J * v
+        # J is the Jacobian of the tensor shard
+        # v is the vector
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # use torch.func.jvp and torch.func.vmap
+        pass
+
+    def jvp_hessian_estimations(self, gradients, num_probes):
+        y, jv = torch.func.jvp(self.inputs, (gradients,), (num_probes,))
+        pass
+
+    def read_and_compare(self):
+        if self.idx != 0:
+        # if self.idx != 23:
+            print("skipping layer\n")
+            return
+        # print(self.inputs.shape)
+        # print(self.pre_outputs.shape)
+
+        print(self.inputs.shape)
+        comb_inp = self.inputs.mean(dim=0)
+        gptq_parallel = (self.inputs.transpose(1, 2).bmm(self.inputs)).mean(dim=0)
+        gptq_aggregated = comb_inp.T @ comb_inp
+        print(gptq_parallel.shape)
+        print(gptq_aggregated.shape)
+        print(gptq_parallel)
+        print(gptq_aggregated)
+        print()
+
+        # Split fused W into individual weight matrices as per mamba2
+        W_z = self.layer.in_proj.weight[:self.layer.d_inner, :]
+        W_x = self.layer.in_proj.weight[self.layer.d_inner:2 * self.layer.d_inner, :]
+        W_b = self.layer.in_proj.weight[2 * self.layer.d_inner:2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state, :]
+        W_c = self.layer.in_proj.weight[2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state:2 * self.layer.d_inner + 2 * self.layer.ngroups * self.layer.d_state, :]
+        W_t = self.layer.in_proj.weight[-self.layer.nheads:, :]
+
+        z_shards, x_shards, b_shards, c_shards = self.read_shards()
+        z_shards = self.int_keys(z_shards)
+        x_shards = self.int_keys(x_shards)
+        b_shards = self.int_keys(b_shards)
+        c_shards = self.int_keys(c_shards)
+        self.convert_to_hessian(z_shards)
+        self.convert_to_hessian(x_shards)
+        self.convert_to_hessian(b_shards)
+        self.convert_to_hessian(c_shards)
+        raise ValueError("Balls!!")
+
+        rand_channel = np.array([0, 4, 8, 12, 16, 20, 24, 28, 35, 39, 43, 47, 51, 55, 59, 63])
+        rand_channel = np.array([0, 9, 18, 27, 36, 45, 54, 63])
+        heads = self.layer.headdim*np.arange(self.layer.nheads)
+        rand_channel = np.add.outer(heads, rand_channel).transpose().flatten()
+
+        '''
+
+
+        # Build probes for JVP -- they should be dotted with outputs, so dimension is same as self.pre_outputs
+        max_probes = 1024
+        print(self.pre_outputs.shape)
+        probes = torch.randn(max_probes, self.pre_outputs.shape[1], self.pre_outputs.shape[2], device=self.dev)
+        probes_rademacher = (torch.randint(0, 2, (max_probes, self.pre_outputs.shape[1], self.pre_outputs.shape[2]), device=self.dev)) * 2 - 1
+
+        # probes = probes_rademacher
+
+        # dot product of probes and J_filt, batched across probes
+        JVP_scalars = (probes.reshape(max_probes, -1) * self.pre_outputs.reshape(-1)).sum(dim=1)
+        print(JVP_scalars.shape)
+
+        t0 = time.time()
+        # get gradients of JVP_scalars with respect to self.layer.in_proj.weight
+        Gs = []
+        for i in range(max_probes):
+            gi_full, = torch.autograd.grad(
+                outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
+                retain_graph=True,
+                create_graph=False,
+            )
+            Gs.append(gi_full[rand_param, :][:, rand_input])
+
+        G = torch.stack(Gs, dim=0)
+        print(G.shape) 
+
+        G = G.reshape(G.shape[0], -1).double()
+        print(time.time() - t0)
+
+        '''
+        
+        '''
+        H_individual = torch.bmm(G.transpose(1, 2), G)
+        print(H_individual.shape)
+        '''
+
+        '''
+
+        print(G[:8].t())
+        print(G[:8])
+
+        H_est_8 = (G[:8].t()/8 @ G[:8])
+        H_est_16 = (G[:16].t()/16 @ G[:16])
+        H_est_32 = (G[:32].t()/32 @ G[:32])
+        H_est_64 = (G[:64].t()/64 @ G[:64])
+        H_est_128 = (G[:128].t()/128 @ G[:128])
+        H_est_256 = (G[:256].t()/256 @ G[:256])
+        H_est_512 = (G[:512].t()/512 @ G[:512])
+        H_est_full = (G.t()/max_probes @ G)
+
+        H_estimate_list = [H_est_8, H_est_16, H_est_32, H_est_64, H_est_128, H_est_256, H_est_512, H_est_full, H_raw]
+
+        fro_norm_error_percents = []
+        diagonal_error_percents = []
+        fro_norm_error_percents_ref = []
+        diagonal_error_percents_ref = []
+
+        probe_counts = [8, 16, 32, 64, 128, 256, 512, max_probes]
+        log_probe_counts = [math.log2(x) for x in probe_counts]
+
+        '''
+
+        '''
+        for H in H_estimate_list: 
+            # print(H)
+            print(((H.to(H_raw.device) - H_raw).abs()).mean()) 
+
+        '''
+
+        '''   
+
+        for i, H in enumerate(H_estimate_list):  
+            if i == len(H_estimate_list) - 1:
+                break
+            samples_used = 2 ** (i+3)
+            if i == 0:
+                print(f"Using {samples_used} samples")
+                # print(H)
+            else:
+                print(f"Using {samples_used} samples")
+                # print(H)
+                error = (H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs()
+                error_ref = (H.to(H_estimate_list[-2].device) - H_estimate_list[-2]).abs()
+                fro_norm_prior = torch.linalg.norm(H_estimate_list[i-1])
+                fro_norm_current = torch.linalg.norm(H)
+                fro_norm_error = torch.linalg.norm(error)
+                fro_norm_error_ref = torch.linalg.norm(error_ref)
+                fro_norm_ref = torch.linalg.norm(H_estimate_list[-2])
+
+                diagonal_error_norm = torch.linalg.norm(error.diag())
+                diagonal_prior_norm = torch.linalg.norm(H_estimate_list[i-1].diag())
+                diagonal_current_norm = torch.linalg.norm(H.diag())
+                diagonal_ref_norm = torch.linalg.norm(H_estimate_list[-2].diag())
+                diagonal_error_norm_ref = torch.linalg.norm(error_ref.diag())
+
+
+                print(100*fro_norm_error/fro_norm_prior)
+                print(100*diagonal_error_norm/diagonal_prior_norm)
+                print(100*fro_norm_error_ref/fro_norm_ref)
+                print(100*diagonal_error_norm_ref/diagonal_ref_norm)
+
+                fro_norm_error_percents.append((100*fro_norm_error/fro_norm_prior).item())
+                diagonal_error_percents.append((100*diagonal_error_norm/diagonal_prior_norm).item())
+                fro_norm_error_percents_ref.append((100*fro_norm_error_ref/fro_norm_ref).item())
+                diagonal_error_percents_ref.append((100*diagonal_error_norm_ref/diagonal_ref_norm).item())
+                # print(100*(((H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs())/H_estimate_list[i-1]))
+                # print(100*(((H.to(H_estimate_list[i-1].device) - H_estimate_list[i-1]).abs())/H_estimate_list[i-1]).median())
+            print()
+            print()    
+
+        # pass
+
+        # Create plots
+        plt.plot(log_probe_counts[1:], fro_norm_error_percents, label='||H(P) - H(P/2)||/||H(P/2)||')
+        plt.plot(log_probe_counts[1:], diagonal_error_percents, label='||Diag(H(P) - H(P/2))||/||Diag(H(P/2))||')
+        plt.plot(log_probe_counts[1:], fro_norm_error_percents_ref, label='||H(P) - H(1024)||/||H(1024)||')
+        plt.plot(log_probe_counts[1:], diagonal_error_percents_ref, label='||Diag(H(P) - H(P/2))||/||Diag(H(1024))||')
+        plt.xlabel('Log2(Probe Count P)')
+        plt.ylabel('Error Percentage')
+        plt.title('Error vs. Log Probe Count P')
+        plt.legend()
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_1.3b_Layer_{self.idx}_Log.png")
+        # clear plot
+        plt.clf()
+
+        plt.plot(probe_counts[1:], fro_norm_error_percents, label='||H(P) - H(P/2)||/||H(P/2)||')
+        plt.plot(probe_counts[1:], diagonal_error_percents, label='||Diag(H(P) - H(P/2))||/||Diag(H(P/2))||')
+        plt.plot(probe_counts[1:], fro_norm_error_percents_ref, label='||H(P) - H(1024)||/||H(1024)||')
+        plt.plot(probe_counts[1:], diagonal_error_percents_ref, label='||Diag(H(P) - H(P/2))||/||Diag(H(1024))||')
+        plt.xlabel('Probe Count P')
+        plt.ylabel('Error Percentage')
+        plt.title('Error vs. Probe Count P')
+        plt.legend()
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_Identity.png")
+
+
+        raise ValueError(f"Layer {self.idx} over!")
+        '''
+        
+        raise ValueError(f"Layer {self.idx} over!")
     
     def free(self):
         torch.cuda.empty_cache()
