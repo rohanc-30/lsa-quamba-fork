@@ -456,7 +456,7 @@ class SMGPTQ():
                 for key, value in c_shards.items():
                     print(key, value.shape)
                 print()
-                raise ValueError("Balls!!")
+                raise ValueError("Stop!!")
             '''
         
         path = f'../jacobian_block_samples/130m/layer{self.idx}'
@@ -647,8 +647,8 @@ class SMGPTQ():
         for key, value in tensor_shard.items():
             final_shard[int(key)] = value / self.inputs.shape[0] # divide by batch size to get average instead of sum
         return final_shard
-
-    def convert_to_hessian(self, tensor_shard):
+    
+    def convert_to_hessian_slow(self, tensor_shard):
         hessian_shard = {}
         for key, value in tensor_shard.items():
             # print(value)
@@ -659,8 +659,68 @@ class SMGPTQ():
             print(key, hessian_shard[key].shape)
         print()
         return hessian_shard
+
+    def convert_to_hessian(self, tensor_shard):
+        hessian_shard = {}
+
+        def flatten_shard(tensor_shard):
+            return torch.stack(list(tensor_shard.values()), dim=0)
+
+        def convert_to_hessian_1d(tensor):
+            return tensor.t() @ tensor
+        
+        flattened_shard = flatten_shard(tensor_shard)
+
+        if len(flattened_shard.shape) > 3:
+            flattened_shard = flattened_shard.reshape(flattened_shard.shape[0], flattened_shard.shape[1], -1)
+
+        hessian_tensor = flattened_shard.transpose(1, 2).bmm(flattened_shard)
+        
+        # torch.func.vmap(convert_to_hessian_helper)(torch.tensor(list(tensor_shard.keys())))
+        for i, key in enumerate(tensor_shard.keys()):
+            hessian_shard[key] = hessian_tensor[i, :, :]
+
+        return hessian_shard
     
-    def jvp_gradients(self, max_probes, tensor_shard):
+    def jvp_gradients_and_hessian_slow(self, tensor_shard, max_probes=1024, step_size=8):
+        # implement JVPs
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # JVP is the Jacobian-Vector Product
+        # JVP = J * v
+        # J is the Jacobian of the tensor shard
+        # v is the vector
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # JVP gradients are the gradients of the JVP with respect to the tensor shard
+        # operate naively
+        channels = torch.tensor(list(tensor_shard.keys()))
+        probes = torch.randn(max_probes, self.pre_outputs.shape[1], channels.shape[0]).to(self.pre_outputs.device)
+
+        JVP_scalars = (probes * self.pre_outputs[:, :, channels]/self.inputs.shape[0]).sum(dim=1).sum(dim=1) # divide by batch size to get average instead of sum
+
+        Gs = []
+
+        for i in range(max_probes):
+            gi_full, = torch.autograd.grad(
+                outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
+                retain_graph=True,
+                create_graph=False,
+            )
+            gi = gi_full[channels]
+            Gs.append(gi)
+
+        G = torch.stack(Gs, dim=0)
+        print(G.shape)
+        print(G)
+
+        H_dict = {}
+
+        for i in range(step_size, max_probes + 1, step_size):
+            H_dict[i] = (G[:i].permute(1, 2, 0) / i).bmm(G[:i].permute(1, 0, 2))
+        return H_dict
+
+
+    
+    def jvp_gradients_fast(self, tensor_shard, max_probes=1024):
         # implement JVPs
         # JVP gradients are the gradients of the JVP with respect to the tensor shard
         # JVP is the Jacobian-Vector Product
@@ -670,10 +730,45 @@ class SMGPTQ():
         # JVP gradients are the gradients of the JVP with respect to the tensor shard
         # JVP gradients are the gradients of the JVP with respect to the tensor shard
         # use torch.func.jvp and torch.func.vmap
-        pass
+
+        params = dict(self.layer.named_parameters())
+        buffers = dict(self.layer.named_buffers())
+
+        W = params['in_proj.weight']
+
+        params_const = {k: v for k, v in params.items() if k != 'in_proj.weight'}
+
+        def funcforward(W, x):
+            p = dict(params_const)
+            p['in_proj.weight'] = W
+            return torch.func.functional_call(self.layer, (p, buffers), (x,))
+
+        self.layer.use_mem_eff_path = True
+        print(self.layer.use_mem_eff_path)
+        
+        y, pullback = torch.func.vjp(funcforward, W, self.inputs)
+
+        print('in function!!')
+        print(y.shape)
+
+        def one_vjp(r, channels=None):
+            dW, _ = pullback(r)
+            if channels == None:
+                return dW
+            else:
+                return dW[channels]
+
+        cotangent = torch.randn_like(y)
+        JVP_scalars, _ = pullback(cotangent)
+        print(JVP_scalars.shape)
+
+        cotangent_matrix = torch.randn(max_probes, *y.shape)
+        JVP_scalars_matrix = torch.func.vmap(one_vjp)(cotangent_matrix)
+        print(JVP_scalars_matrix.shape)
+
+        raise ValueError("Stop!!")
 
     def jvp_hessian_estimations(self, gradients, num_probes):
-        y, jv = torch.func.jvp(self.inputs, (gradients,), (num_probes,))
         pass
 
     def read_and_compare(self):
@@ -706,11 +801,29 @@ class SMGPTQ():
         x_shards = self.int_keys(x_shards)
         b_shards = self.int_keys(b_shards)
         c_shards = self.int_keys(c_shards)
-        self.convert_to_hessian(z_shards)
-        self.convert_to_hessian(x_shards)
-        self.convert_to_hessian(b_shards)
-        self.convert_to_hessian(c_shards)
-        raise ValueError("Balls!!")
+        z_hessian = self.convert_to_hessian(z_shards)
+        z_jvp_gradients = self.jvp_gradients_and_hessian_slow(z_hessian, max_probes=1024)
+
+        print("True Hessian:")
+        print(z_hessian[0])
+        print()
+
+        print("Estimated Hessians:")
+        for k in z_jvp_gradients.keys():
+            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
+                continue
+            print(k)
+            # print(z_jvp_gradients[k].shape)
+            print(z_jvp_gradients[k][0, :, :])
+            print()
+
+
+        raise ValueError("Stop!!")
+
+
+        x_hessian = self.convert_to_hessian(x_shards)
+        b_hessian = self.convert_to_hessian(b_shards)
+        c_hessian = self.convert_to_hessian(c_shards)
 
         rand_channel = np.array([0, 4, 8, 12, 16, 20, 24, 28, 35, 39, 43, 47, 51, 55, 59, 63])
         rand_channel = np.array([0, 9, 18, 27, 36, 45, 54, 63])
