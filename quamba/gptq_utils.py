@@ -646,6 +646,7 @@ class SMGPTQ():
         final_shard = {}
         for key, value in tensor_shard.items():
             final_shard[int(key)] = value / self.inputs.shape[0] # divide by batch size to get average instead of sum
+            final_shard[int(key)] = final_shard[int(key)]
         return final_shard
     
     def convert_to_hessian_slow(self, tensor_shard):
@@ -660,7 +661,7 @@ class SMGPTQ():
         print()
         return hessian_shard
 
-    def convert_to_hessian(self, tensor_shard):
+    def convert_to_hessian(self, tensor_shard, tensor_name='None'):
         hessian_shard = {}
 
         def flatten_shard(tensor_shard):
@@ -678,11 +679,24 @@ class SMGPTQ():
         
         # torch.func.vmap(convert_to_hessian_helper)(torch.tensor(list(tensor_shard.keys())))
         for i, key in enumerate(tensor_shard.keys()):
-            hessian_shard[key] = hessian_tensor[i, :, :]
-
+            print(i, key)
+            print(self.layer.d_state * self.layer.ngroups)
+            print(key % (self.layer.d_state * self.layer.ngroups))
+            print(hessian_shard.keys())
+            print()
+            if (tensor_name == 'b' or tensor_name == 'c') and key % ((self.layer.d_state * self.layer.ngroups)/2) in hessian_shard.keys():
+                hessian_shard[int(key % ((self.layer.d_state * self.layer.ngroups)/2))] += hessian_tensor[i, :, :]
+            else:
+                if (tensor_name == 'b' or tensor_name == 'c'):
+                    hessian_shard[int(key % ((self.layer.d_state * self.layer.ngroups)/2))] = hessian_tensor[i, :, :]
+                else:
+                    hessian_shard[key] = hessian_tensor[i, :, :]
+        print(hessian_shard.keys())
+        if max(hessian_shard.keys()) > 3372:
+            raise ValueError("Hessian keys are greater than d_inner!")
         return hessian_shard
     
-    def jvp_gradients_and_hessian_slow(self, tensor_shard, max_probes=1024, step_size=8):
+    def jvp_gradients_and_hessian_slow(self, tensor_shard, max_probes=1024, step_size=8, tensor_name='z'):
         # implement JVPs
         # JVP gradients are the gradients of the JVP with respect to the tensor shard
         # JVP is the Jacobian-Vector Product
@@ -693,24 +707,78 @@ class SMGPTQ():
         # JVP gradients are the gradients of the JVP with respect to the tensor shard
         # operate naively
         channels = torch.tensor(list(tensor_shard.keys()))
+        print(channels)
+
+        out_channels = channels
+        
+        print(out_channels)
+
         probes = torch.randn(max_probes, self.pre_outputs.shape[1], channels.shape[0]).to(self.pre_outputs.device)
 
         JVP_scalars = (probes * self.pre_outputs[:, :, channels]/self.inputs.shape[0]).sum(dim=1).sum(dim=1) # divide by batch size to get average instead of sum
 
         Gs = []
 
-        for i in range(max_probes):
-            gi_full, = torch.autograd.grad(
-                outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
-                retain_graph=True,
-                create_graph=False,
-            )
-            gi = gi_full[channels]
-            Gs.append(gi)
+        if tensor_name == 'x':
+            channels = channels + self.layer.d_inner
+        elif tensor_name == 'b':
+            # channels = 2 * channels
+            # channels = torch.cat([channels, channels + 1], dim=0)
+            channels = channels + 2*self.layer.d_inner
+        elif tensor_name == 'c':
+            # channels = 2 * channels
+            # channels = torch.cat([channels, channels + 1], dim=0)
+            channels = channels + 2*self.layer.d_inner + self.layer.d_state * self.layer.ngroups
+
+        print(channels)
+
+        if tensor_name == 'b' or tensor_name == 'c':
+            for c in channels:
+                print(c)
+            JVP_scalars = []
+            for o in out_channels:
+                print(o)
+                all_heads = torch.arange(self.layer.nheads) * (self.layer.headdim)
+                out_channels_this_head = all_heads + o
+                print(out_channels_this_head)
+                probes = torch.randn(max_probes, self.pre_outputs.shape[1], out_channels_this_head.shape[0]).to(self.pre_outputs.device)
+                JVP_scalars.append((probes * self.pre_outputs[:, :, out_channels_this_head]/self.inputs.shape[0]).sum(dim=1).sum(dim=1))
+            print(len(JVP_scalars))
+            print(JVP_scalars[0].shape)
+            print(JVP_scalars)
+            rel_outs = [[c, c+1] for c in channels]
+            print(rel_outs)
+            for JVP_channels, derivative_channels in zip(JVP_scalars, rel_outs):
+                l = []
+                for i in range(max_probes):
+                    gi_full, = torch.autograd.grad(
+                        outputs=JVP_channels[i], inputs=self.layer.in_proj.weight,
+                        retain_graph=True,
+                        create_graph=False,
+                    )
+                    # print(gi_full.shape)
+                    gi = gi_full[derivative_channels, :]
+                    # print(gi.shape)
+                    l.append(gi)
+                Gs.append(torch.stack(l, dim=0).reshape(max_probes, -1))
+                print(Gs[-1].shape)
+            print()
+        else:
+            for i in range(max_probes):
+                gi_full, = torch.autograd.grad(
+                    outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
+                    retain_graph=True,
+                    create_graph=False,
+                )
+                gi = gi_full[channels]
+                Gs.append(gi)
 
         G = torch.stack(Gs, dim=0)
+        if tensor_name == 'b' or tensor_name == 'c':
+            G = G.transpose(0, 1)
         print(G.shape)
-        print(G)
+
+        G = G.float()
 
         H_dict = {}
 
@@ -771,9 +839,83 @@ class SMGPTQ():
     def jvp_hessian_estimations(self, gradients, num_probes):
         pass
 
+    def plot_hessian_estimations(self, true_hessians, H_dict, gptq_val=None, tensor_name=None):
+        probe_counts = list(H_dict.keys())
+        print(probe_counts)
+        errors = []
+        gptq_errors = []
+        for i, k in enumerate(true_hessians.keys()):
+            true_hessian = true_hessians[k]
+            error_channel = []
+            for k2 in H_dict.keys():
+                estimated_hessian = H_dict[k2][i, :, :]
+                true_hessian = true_hessian.to(estimated_hessian.device)
+                # print(true_hessian - estimated_hessian)
+                # print(torch.linalg.norm(true_hessian - estimated_hessian))
+                # print(torch.linalg.norm(true_hessian))
+                if torch.isinf(estimated_hessian).any():
+                    print("Inf in estimated hessian!")
+                if torch.isinf(true_hessian).any():
+                    print("Inf in true hessian!")
+                    continue
+                if torch.linalg.norm(true_hessian).isinf():
+                    print(torch.linalg.norm(true_hessian.double()))
+                    print(torch.linalg.norm(true_hessian.double()/10000))
+                    print()
+                # error_item = torch.linalg.norm(true_hessian - estimated_hessian)/torch.linalg.norm(true_hessian.double())
+
+                error_item = torch.nn.functional.cosine_similarity(true_hessian.flatten().double(), estimated_hessian.flatten().double(), dim=0)
+                if torch.isnan(error_item):
+                    # error_item = torch.linalg.norm(true_hessian/10000 - estimated_hessian/10000)/torch.linalg.norm(true_hessian.double()/10000)
+                    error_item = torch.nn.functional.cosine_similarity(true_hessian.flatten().double()/10000, estimated_hessian.flatten().double()/10000, dim=0)
+                error_channel.append(error_item)
+            if len(error_channel) == 0:
+                continue
+            if gptq_val is not None:
+                # gptq_error_item = torch.linalg.norm((gptq_val/10000 - true_hessian/10000).double())/torch.linalg.norm(true_hessian.double()/10000)
+                if torch.isinf(gptq_val).any():
+                    print("Inf in gptq_val!")
+                gptq_error_item = torch.nn.functional.cosine_similarity(gptq_val.flatten().double()/10000, true_hessian.flatten().double()/10000, dim=0)
+                gptq_errors.append(gptq_error_item.item())
+            error_channel = torch.stack(error_channel, dim=0)
+            if torch.isnan(error_channel).any():
+                print(i, k)
+                print(H_dict[1024][i, :, :])
+                print(true_hessian)
+                print(H_dict[1024][i, :, :].isnan().any())
+                print(true_hessian.isnan().any())
+                print(torch.linalg.norm(true_hessian))
+                print()
+            print(error_channel)
+            errors.append(error_channel)
+        errors = torch.stack(errors, dim=0)
+        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine.npy", errors.cpu().numpy())
+        errors = errors.mean(dim=0)
+        print(errors)
+        if gptq_val is not None:
+            print(gptq_errors)
+            print(len(gptq_errors))
+            np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_cosine.npy", np.array(gptq_errors))
+        plt.plot(probe_counts, errors.cpu().numpy())
+        plt.xlabel('Probe Count')
+        plt.ylabel('Error')
+        title = f'Error vs. Probe Count in Layer {self.idx}'
+        if tensor_name is not None:
+            title += f' for {tensor_name}'
+        plt.title(title)
+        if gptq_val is not None:
+            # print horizontal line for gptq_error_mean
+            gptq_error_mean = sum(gptq_errors)/len(gptq_errors)
+            print(gptq_error_mean)
+            # plt.axhline(gptq_error_mean, color='red', linestyle='--')
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_{tensor_name}_Error.png")
+        plt.clf()
+
+
     def read_and_compare(self):
-        if self.idx != 0:
-        # if self.idx != 23:
+        if self.idx not in [1, 4, 7, 10, 13, 16, 19, 22, 23]:
+        # if self.idx != 0:
             print("skipping layer\n")
             return
         # print(self.inputs.shape)
@@ -781,6 +923,10 @@ class SMGPTQ():
 
         print(self.inputs.shape)
         comb_inp = self.inputs.mean(dim=0)
+        if torch.isinf(comb_inp).any() or torch.isnan(comb_inp).any():
+            print("Comb inp broke!!")
+            raise ValueError("ERROR!!")
+        comb_inp = comb_inp.float()
         gptq_parallel = (self.inputs.transpose(1, 2).bmm(self.inputs)).mean(dim=0)
         gptq_aggregated = comb_inp.T @ comb_inp
         print(gptq_parallel.shape)
@@ -798,11 +944,11 @@ class SMGPTQ():
 
         z_shards, x_shards, b_shards, c_shards = self.read_shards()
         z_shards = self.int_keys(z_shards)
-        x_shards = self.int_keys(x_shards)
-        b_shards = self.int_keys(b_shards)
-        c_shards = self.int_keys(c_shards)
+
+
+        
         z_hessian = self.convert_to_hessian(z_shards)
-        z_jvp_gradients = self.jvp_gradients_and_hessian_slow(z_hessian, max_probes=1024)
+        z_jvp_gradients = self.jvp_gradients_and_hessian_slow(z_hessian, max_probes=1024, step_size=8, tensor_name='z')
 
         print("True Hessian:")
         print(z_hessian[0])
@@ -816,6 +962,83 @@ class SMGPTQ():
             # print(z_jvp_gradients[k].shape)
             print(z_jvp_gradients[k][0, :, :])
             print()
+        
+        self.plot_hessian_estimations(z_hessian, z_jvp_gradients, gptq_val=gptq_aggregated, tensor_name='z')
+        
+        del z_shards, z_hessian, z_jvp_gradients
+        self.free()
+        
+        x_shards = self.int_keys(x_shards)
+        x_hessian = self.convert_to_hessian(x_shards)
+        x_jvp_gradients = self.jvp_gradients_and_hessian_slow(x_hessian, max_probes=1024, step_size=8, tensor_name='x')
+        
+        print("True Hessian:")
+        print(x_hessian[0])
+        print()
+
+        print("Estimated Hessians:")
+        for k in x_jvp_gradients.keys():
+            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
+                continue
+            print(k)
+            # print(z_jvp_gradients[k].shape)
+            print(x_jvp_gradients[k][0, :, :])
+            print()
+        
+        self.plot_hessian_estimations(x_hessian, x_jvp_gradients, gptq_val=gptq_aggregated, tensor_name='x')
+
+        del x_shards, x_hessian, x_jvp_gradients
+        self.free()
+        
+        b_shards = self.int_keys(b_shards)
+        b_hessian = self.convert_to_hessian(b_shards, tensor_name='b')
+        b_jvp_gradients = self.jvp_gradients_and_hessian_slow(b_hessian, max_probes=1024, step_size=8, tensor_name='b')
+
+        print("True Hessian:")
+        print(b_hessian[0])
+        print()
+
+        print("Estimated Hessians:")
+        for k in b_jvp_gradients.keys():
+            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
+                continue
+            print(k)
+            # print(z_jvp_gradients[k].shape)
+            print(b_jvp_gradients[k][0, :, :])
+            print()
+        
+        self.plot_hessian_estimations(b_hessian, b_jvp_gradients, gptq_val=torch.block_diag(gptq_aggregated, gptq_aggregated), tensor_name='b')
+
+        del b_shards, b_hessian, b_jvp_gradients
+        self.free()
+        
+        c_shards = self.int_keys(c_shards)
+        c_hessian = self.convert_to_hessian(c_shards, tensor_name='c')
+        c_jvp_gradients = self.jvp_gradients_and_hessian_slow(c_hessian, max_probes=1024, step_size=8, tensor_name='c')
+
+        print("True Hessian:")
+        print(c_hessian[0])
+        print()
+
+        print("Estimated Hessians:")
+        for k in c_jvp_gradients.keys():
+            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
+                continue
+            print(k)
+            # print(z_jvp_gradients[k].shape)
+            print(c_jvp_gradients[k][0, :, :])
+            print()
+        
+        self.plot_hessian_estimations(c_hessian, c_jvp_gradients, gptq_val=torch.block_diag(gptq_aggregated, gptq_aggregated), tensor_name='c')
+
+        del c_shards, c_hessian, c_jvp_gradients
+        self.free()
+
+        return
+
+        raise ValueError("Stop!!")
+        
+        
 
 
         raise ValueError("Stop!!")
@@ -975,6 +1198,99 @@ class SMGPTQ():
         '''
         
         raise ValueError(f"Layer {self.idx} over!")
+    
+    def stitch_plots(self):
+        if self.idx != 0:
+            print("skipping layer\n")
+        
+        layers = [0, 1, 4, 7, 10, 13, 16, 19, 22, 23]
+
+
+        probe_counts = [8*i for i in range(1, 129)]
+        z_list = []
+        x_list = []
+        b_list = []
+        c_list = []
+
+        gptq_list_z = []
+        gptq_list_x = []
+        gptq_list_b = []
+        gptq_list_c = []
+
+        for layer in layers:
+            z_list.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}.npy").mean(axis=0))
+            x_list.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}.npy").mean(axis=0))
+            b_list.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}.npy").mean(axis=0))
+            c_list.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}.npy").mean(axis=0))
+
+            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq.npy")).any():
+                gptq_list_z.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq.npy"))
+            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq.npy")).any():
+                gptq_list_x.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq.npy"))
+            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq.npy")).any():
+                gptq_list_b.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq.npy"))
+            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq.npy")).any():
+                gptq_list_c.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq.npy"))
+        
+        z_list = np.stack(z_list, axis=0)
+        x_list = np.stack(x_list, axis=0)
+        b_list = np.stack(b_list, axis=0)
+        c_list = np.stack(c_list, axis=0)
+
+
+        z_list = z_list.mean(axis=0)
+        x_list = x_list.mean(axis=0)
+        b_list = b_list.mean(axis=0)
+        c_list = c_list.mean(axis=0)
+
+        print(gptq_list_z)
+
+        gptq_mean_z = np.mean(gptq_list_z)
+        gptq_mean_x = np.mean(gptq_list_x)
+        gptq_mean_b = np.mean(gptq_list_b)
+        gptq_mean_c = np.mean(gptq_list_c)
+
+        print(gptq_mean_z)
+        print(gptq_mean_x)
+        print(gptq_mean_b)
+        print(gptq_mean_c)
+
+        fig, ax1 = plt.subplots()
+
+        ax1.plot(probe_counts, z_list, label='W_z')
+        ax1.plot(probe_counts, x_list, label='W_x')
+        ax1.plot(probe_counts, b_list, label='W_b')
+        ax1.plot(probe_counts, c_list, label='W_c')
+
+        ax1.set_xlabel('Probe Count (# IID Samples)')
+        ax1.set_ylabel('Error (||Estimate - True||/||True||)')
+        ax1.set_title('Error vs. Probe Count (Averaged Across 10 Layers)')
+
+        ax2 = ax1.twinx()
+        values = [gptq_mean_z, gptq_mean_x, gptq_mean_b, gptq_mean_c]
+        labels = ["GPTQ Error W_z", "GPTQ Error W_x", "GPTQ Error W_b", "GPTQ Error W_c"]
+        colors = ['red', 'green', 'blue', 'purple']
+        for value, label, color in zip(values, labels, colors):
+            ax2.axhline(y=value, label=label, color=color, linestyle='--')
+        
+        ax2.set_ylabel('GPTQ Error (||X^T X - True||/||True||)')
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+
+        plt.show()
+
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Stitched_Averaged.png")
+
+        plt.clf()
+        
+        '''
+        plt.show()
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Stitched.png")
+        plt.clf()
+        '''
+        raise ValueError("Stop!!")
     
     def free(self):
         torch.cuda.empty_cache()
