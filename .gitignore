@@ -9,6 +9,16 @@ logs/
 observer_stats_output/
 quantization_analysis_output/
 
+# Lockfiles
+uv.lock
+
+# Debug/experiment artifacts
+debug_tensors/
+jacobian_jvp_error/
+*.pt
+*.npy
+*.png
+
 # C extensions
 *.so
 

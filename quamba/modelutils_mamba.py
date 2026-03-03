@@ -30,7 +30,8 @@ from .qNorm import QRMSNorm
 from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
 from .observer import PerSSDGroupObserver, CrossHeadMinmaxObserver
 from .observer import CachedStatesCrossHeadMinmaxObserver
-from .gptq_utils import GPTQ, SMGPTQ
+from .gptq_utils import GPTQ
+from .smgptq import SMGPTQ
 from .reorder_utils import get_reorder_params, reorder_mamba
 from .hadamard_utils import had_transform
 from .data_loaders import get_loaders
@@ -605,23 +606,7 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
                 layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"])),
                 layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"]))
             ]
-            '''
-            gptq_sm = {
-                "in_proj": SMGPTQ(layer.mixer.in_proj),
-                # "out_proj": SMGPTQ(layer.mixer.out_proj),
-            }
 
-            handles_sm = [
-                layer.mixer.register_forward_hook(partial(add_batch, gptq=gptq_sm["in_proj"])),
-                # layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq_sm["out_proj"])),
-            ]
-            '''
-
-            # gptq = gptq_sm
-            # handles = handles_sm
-
-            # print(inps.shape)
-            # print(residual.shape)
             layer(
                 inps, 
                 residual=residual
@@ -796,9 +781,6 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
 
     def add_batch_layer(module, inp, out, gptq, is_out_layer=False):
         if is_out_layer:
-            print(len(inp))
-            for i, el in enumerate(inp):
-                print(f"Input {i}: {el.shape}")
             gptq.capture_outputs(inp[0], inp[1], out)
         else:
             gptq.capture_inputs(inp[0], out)
@@ -808,23 +790,10 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
     model.backbone.embedding = model.backbone.embedding.cpu()
     torch.cuda.empty_cache()
     for i in tqdm(range(len(layers))):
-        print(f"Layer {i}")
-        # get layer
+        logging.debug(f"Layer {i}")
         layer = layers[i].to(device)
 
         if model_type in ["mamba", "mamba2"]:
-        # create GPTQ objects for in_proj and out_proj
-            '''
-            gptq = {
-                "in_proj": GPTQ(layer.mixer.in_proj),
-                "out_proj": GPTQ(layer.mixer.out_proj),
-            }
-            handles = [
-                layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"])),
-                layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"]))
-            ]
-            '''
-            
             gptq_sm = {
                 "in_proj": SMGPTQ(layer.mixer, idx=i),
             }
@@ -835,15 +804,10 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
             ]
             
 
-            # gptq = gptq_sm
-            # handles = handles_sm
-
             layer(
                 inps, 
                 residual=residual
             )
-            #for h in handles:
-            #    h.remove()
             for h in handles_sm:
                 h.remove()
         else:
@@ -858,20 +822,6 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         del gptq_sm
         
         # collect the outputs for the next layer
-        '''
-        for j in range(nsamples):
-            # print(layer)
-            # print()
-            # print()
-            # print(layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0)))
-            if model_type == "gla":
-                inps[j], _, _ = layer(inps[j].unsqueeze(0))
-                residual[j] = inps[j]
-            else:
-                inps[j], residual[j] = layer(inps[j].unsqueeze(0), residual=residual[j].unsqueeze(0))
-            # raise ValueError
-        '''
-        
         inps, residual = layer(inps, residual=residual)
 
         # Kill old gradients but keep differentiable
@@ -924,7 +874,6 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
     gc.collect()
 
     model = model.to(device)
-    raise ValueError("Jacobian loop over!")
     return model
 
 
