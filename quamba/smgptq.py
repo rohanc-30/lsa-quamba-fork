@@ -376,16 +376,15 @@ class SMGPTQ:
     def compute_exact_hessian(self, inputs, channel_group='z', jvp_chunk_size=32):
         """Compute exact H = J^T J for a channel group of in_proj.weight.
 
-        Uses chunked forward-mode AD: splits the d_model tangent directions into
-        batches of jvp_chunk_size, computes J_chunk via vmap(jvp), and accumulates
-        H += J_chunk^T @ J_chunk without materializing the full Jacobian.
+        Uses forward-mode AD via a single vmap(jvp) call with internal chunking
+        to compute the full Jacobian J, then forms H = J^T @ J.
 
         Args:
             inputs: (batch, seqlen, d_model) — calibration inputs to the mixer
             channel_group: 'z', 'x', 'b', or 'c'
             jvp_chunk_size: number of tangent directions to vmap simultaneously.
                 Controls peak GPU memory: O(jvp_chunk_size * nheads * chunk_size^2).
-                Default 32 uses ~1-2 GB for 130m.
+                Default 32 uses ~5 GB for 130m; full Jacobian storage ~5 GB.
 
         Returns:
             dict mapping channel_index → (d_model, d_model) Hessian tensor
@@ -443,18 +442,16 @@ class SMGPTQ:
                     )
                     return y.flatten()  # (T * d_ssm,)
 
-                # Chunked JVP: process jvp_chunk_size tangent directions at a time
                 def jvp_fn(tangent):
                     _, jvp_out = torch.func.jvp(f_j, (w_j,), (tangent,))
                     return jvp_out
 
-                for start in range(0, d_model, jvp_chunk_size):
-                    end = min(start + jvp_chunk_size, d_model)
-                    tangent_chunk = basis[start:end]  # (chunk, d_model)
-                    # vmap over the chunk of tangent directions
-                    J_chunk = torch.vmap(jvp_fn)(tangent_chunk)  # (chunk, T*d_ssm)
-                    # Accumulate H += J_chunk^T @ J_chunk
-                    H_j += (J_chunk.float().T @ J_chunk.float())
+                # Single vmap call with internal chunking (avoids PyTorch
+                # multi-call vmap bug). J_T[i] = J @ e_i = column i of J,
+                # so J_T = J^T and H = J_T @ J_T^T.
+                J_T = torch.vmap(jvp_fn, chunk_size=jvp_chunk_size)(basis)
+                H_j += (J_T.float() @ J_T.float().T)
+                del J_T
 
             hessians[j] = H_j / inputs.shape[0]
             logger.debug("Exact Hessian computed for channel %d, shape: %s",
