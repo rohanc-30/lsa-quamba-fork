@@ -373,18 +373,40 @@ class SMGPTQ:
         plt.savefig(os.path.join(self.output_dir, f"Gaussian_130m_Layer_{self.idx}_{tensor_name}_Error.png"))
         plt.clf()
 
-    def compute_exact_hessian(self, inputs, channel_group='z', jvp_chunk_size=32):
+    def _channel_range(self, group_name):
+        """Return the full list of in_proj channel indices for a group."""
+        d_ssm = self.layer.d_ssm
+        if group_name == 'z':
+            return list(range(0, d_ssm))
+        elif group_name == 'x':
+            return list(range(d_ssm, 2 * d_ssm))
+        elif group_name == 'b':
+            return list(range(2 * d_ssm,
+                              2 * d_ssm + self.layer.ngroups * self.layer.d_state))
+        elif group_name == 'c':
+            return list(range(2 * d_ssm + self.layer.ngroups * self.layer.d_state,
+                              2 * d_ssm + 2 * self.layer.ngroups * self.layer.d_state))
+        raise ValueError(f"Unknown group: {group_name}")
+
+    def compute_exact_hessian(self, inputs, channel_group='z', channels=None,
+                              jvp_chunk_size=32, output_chunk_size=None):
         """Compute exact H = J^T J for a channel group of in_proj.weight.
 
-        Uses forward-mode AD via a single vmap(jvp) call with internal chunking
-        to compute the full Jacobian J, then forms H = J^T @ J.
+        Uses forward-mode AD via vmap(jvp) to compute Jacobians, then
+        forms H = J^T @ J. Supports output chunking to avoid materializing
+        the full Jacobian.
 
         Args:
             inputs: (batch, seqlen, d_model) — calibration inputs to the mixer
-            channel_group: 'z', 'x', 'b', or 'c'
+            channel_group: 'z', 'x', 'b', or 'c' — which group of in_proj rows
+            channels: explicit list of channel indices to compute. If None,
+                computes all channels in the group.
             jvp_chunk_size: number of tangent directions to vmap simultaneously.
-                Controls peak GPU memory: O(jvp_chunk_size * nheads * chunk_size^2).
-                Default 32 uses ~5 GB for 130m; full Jacobian storage ~5 GB.
+                Controls peak intermediate memory during JVP computation.
+            output_chunk_size: if set, chunk the output dimension and accumulate
+                H += J_chunk^T @ J_chunk. Keeps memory O(d_model * output_chunk_size)
+                instead of O(d_model * T * d_ssm), at the cost of recomputing the
+                forward pass per chunk. If None, materializes the full Jacobian.
 
         Returns:
             dict mapping channel_index → (d_model, d_model) Hessian tensor
@@ -393,8 +415,10 @@ class SMGPTQ:
         d_model = mixer.d_model
         d_ssm = mixer.d_ssm
 
-        # Channel ranges in in_proj output (assumes d_mlp=0, d_ssm == d_inner)
-        if channel_group == 'z':
+        # Determine channels to compute
+        if channels is not None:
+            channels = list(channels)
+        elif channel_group == 'z':
             channels = list(range(0, d_ssm))
         elif channel_group == 'x':
             channels = list(range(d_ssm, 2 * d_ssm))
@@ -422,6 +446,11 @@ class SMGPTQ:
         basis = torch.eye(d_model, device=self.dev, dtype=W.dtype)
         hessians = {}
 
+        # Pre-compute output dimension for chunking
+        if output_chunk_size is not None:
+            seqlen = inputs.shape[1]
+            out_dim = seqlen * d_ssm
+
         for j in channels:
             H_j = torch.zeros(d_model, d_model, device=self.dev, dtype=torch.float32)
 
@@ -429,29 +458,46 @@ class SMGPTQ:
                 u = inputs[sample_idx].detach()  # (seqlen, d_model)
                 w_j = W[j]
 
-                def f_j(w_j_arg):
-                    """Forward pass with row j of in_proj as free variable."""
-                    W_full = torch.cat([W[:j], w_j_arg.unsqueeze(0), W[j+1:]], dim=0)
-                    y = functional_mixer_forward(
-                        u, W_full, conv_w, conv_b, A_log, D_param, dt_bias,
-                        norm_w, mixer.headdim, mixer.ngroups, mixer.d_state,
-                        mixer.d_ssm, mixer.nheads, mixer.chunk_size,
-                        mixer.d_conv, norm_eps=norm_eps,
-                        norm_before_gate=norm_before_gate,
-                        norm_group_size=norm_group_size,
-                    )
-                    return y.flatten()  # (T * d_ssm,)
+                def _make_f_j(out_start=None, out_end=None):
+                    """Create forward function, optionally slicing the output."""
+                    def f_j(w_j_arg):
+                        W_full = torch.cat([W[:j], w_j_arg.unsqueeze(0), W[j+1:]], dim=0)
+                        y = functional_mixer_forward(
+                            u, W_full, conv_w, conv_b, A_log, D_param, dt_bias,
+                            norm_w, mixer.headdim, mixer.ngroups, mixer.d_state,
+                            mixer.d_ssm, mixer.nheads, mixer.chunk_size,
+                            mixer.d_conv, norm_eps=norm_eps,
+                            norm_before_gate=norm_before_gate,
+                            norm_group_size=norm_group_size,
+                        )
+                        y_flat = y.flatten()
+                        if out_start is not None:
+                            return y_flat[out_start:out_end]
+                        return y_flat
+                    return f_j
 
-                def jvp_fn(tangent):
-                    _, jvp_out = torch.func.jvp(f_j, (w_j,), (tangent,))
-                    return jvp_out
-
-                # Single vmap call with internal chunking (avoids PyTorch
-                # multi-call vmap bug). J_T[i] = J @ e_i = column i of J,
-                # so J_T = J^T and H = J_T @ J_T^T.
-                J_T = torch.vmap(jvp_fn, chunk_size=jvp_chunk_size)(basis)
-                H_j += (J_T.float() @ J_T.float().T)
-                del J_T
+                if output_chunk_size is None:
+                    # Materialize full J^T, then H = J^T @ J^T.T
+                    f_j = _make_f_j()
+                    def jvp_fn(tangent):
+                        _, jvp_out = torch.func.jvp(f_j, (w_j,), (tangent,))
+                        return jvp_out
+                    J_T = torch.vmap(jvp_fn, chunk_size=jvp_chunk_size)(basis)
+                    H_j += (J_T.float() @ J_T.float().T)
+                    del J_T
+                else:
+                    # Chunk over output dim: accumulate H += J_chunk^T @ J_chunk
+                    # Recomputes forward pass per chunk but avoids storing full J.
+                    for out_start in range(0, out_dim, output_chunk_size):
+                        out_end = min(out_start + output_chunk_size, out_dim)
+                        f_j_chunk = _make_f_j(out_start, out_end)
+                        def jvp_fn_chunk(tangent, _f=f_j_chunk):
+                            _, jvp_out = torch.func.jvp(_f, (w_j,), (tangent,))
+                            return jvp_out
+                        J_chunk_T = torch.vmap(jvp_fn_chunk,
+                                               chunk_size=jvp_chunk_size)(basis)
+                        H_j += (J_chunk_T.float() @ J_chunk_T.float().T)
+                        del J_chunk_T
 
             hessians[j] = H_j / inputs.shape[0]
             logger.debug("Exact Hessian computed for channel %d, shape: %s",
@@ -480,22 +526,22 @@ class SMGPTQ:
         if use_exact_hessian:
             # Compute exact Hessians on-the-fly via jacfwd (no shard files needed)
             for group_name in ['z', 'x', 'b', 'c']:
-                logger.info("Computing exact Hessian for group '%s' (max_channels=%d)",
-                            group_name, max_channels)
-                exact_H = self.compute_exact_hessian(self.inputs,
-                                                     channel_group=group_name)
-                # Subsample to max_channels for feasibility
-                channel_keys = list(exact_H.keys())[:max_channels]
-                exact_H_subset = {k: exact_H[k] for k in channel_keys}
-                jvp_H = self.estimate_hessian_jvp(exact_H_subset,
+                # Build the first max_channels channel indices for this group
+                group_channels = self._channel_range(group_name)[:max_channels]
+                logger.info("Computing exact Hessian for group '%s', channels=%s",
+                            group_name, group_channels)
+                exact_H = self.compute_exact_hessian(
+                    self.inputs, channel_group=group_name,
+                    channels=group_channels)
+                jvp_H = self.estimate_hessian_jvp(exact_H,
                                                    tensor_name=group_name)
                 gptq_val = gptq_aggregated
                 if group_name in ('b', 'c'):
                     gptq_val = torch.block_diag(gptq_aggregated, gptq_aggregated)
-                self.plot_hessian_estimations(exact_H_subset, jvp_H,
+                self.plot_hessian_estimations(exact_H, jvp_H,
                                               gptq_val=gptq_val,
                                               tensor_name=group_name)
-                del exact_H, exact_H_subset, jvp_H
+                del exact_H, jvp_H
                 self.free()
         else:
             # Existing shard-based path
