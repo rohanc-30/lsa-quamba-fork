@@ -5,6 +5,7 @@ import logging
 from tqdm import tqdm
 from functools import partial
 import json
+import time
 
 import torch
 import torch.nn as nn
@@ -574,8 +575,8 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
             pass
 
     # the hook to collect inputs for in_proj, out_proj, and lm_head
-    def add_batch(module, inp, out, gptq):
-        gptq.add_batch(inp[0].data, out.data)
+    def add_batch(module, inp, out, gptq, name='in_proj'):
+        gptq.add_batch(inp[0].data, out.data, name=name)
 
     layers[0] = layers[0].module # remove Catcher
     layers[0] = layers[0].cpu()
@@ -602,8 +603,8 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
                 "out_proj": GPTQ(layer.mixer.out_proj),
             }
             handles = [
-                layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"])),
-                layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"]))
+                layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"], name="in_proj")),
+                layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"], name="out_proj"))
             ]
             '''
             gptq_sm = {
@@ -622,10 +623,12 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
 
             # print(inps.shape)
             # print(residual.shape)
+            t0_forward = time.time()
             layer(
                 inps, 
                 residual=residual
             )
+            print(f"Time taken to forward pass: {time.time() - t0_forward} seconds")
             for h in handles:
                 h.remove()
             #for h in handles_sm:
@@ -853,7 +856,7 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         
         for name in gptq_sm.keys():
             logging.debug(f"Calculating Jacobian for layer.{i}.mixer.{name} with {bits} bits")
-            gptq_sm[name].read_and_compare()
+            gptq_sm[name].stitch_plots()
             gptq_sm[name].free()
         del gptq_sm
         
@@ -1338,7 +1341,7 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     print(args.apply_gptq)
     if args.apply_gptq:
         save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
-        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        # model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
         print(model)
     # Replace (reordered, fused, and GPTQ quantized) modules with quantized version
     

@@ -96,6 +96,7 @@ def quant(w, s, num_bits=4):
 
 class GPTQ:
     def __init__(self, layer):
+
         self.layer = layer
         self.dev = self.layer.weight.device
         # HY: To save memory, we use float16 to compute distances for non-uniform quantization
@@ -119,7 +120,7 @@ class GPTQ:
     ### Engineering work to do: determine if hook can materialize J online
     ### Side quests: work on understanding activation rearrangement, extend quantization to OPT
     ### Questions: does SM-GPTQ look like normal GPTQ for out_proj?
-    def add_batch(self, inp, out):
+    def add_batch(self, inp, out, name='in_proj'):
         '''
         print(torch.cuda.get_device_name())
         print("Total VRAM (GB):", torch.cuda.get_device_properties(0).total_memory / 1e9)
@@ -130,13 +131,13 @@ class GPTQ:
         print(out.shape)
         print()
         '''
-        
+        self.name = name
 
 
         # Out-channel 0 jacobian
 
         # raise ValueError
-
+        t0_hessian = time.time()
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0] 
@@ -151,8 +152,10 @@ class GPTQ:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
+        print(f"Time taken to compute Hessian for {self.name}: {time.time() - t0_hessian} seconds")
     
     def fasterquant(self, group_size=128, percdamp=.01, w_bits=4, dtype=torch.float32):
+        t0_fasterquant = time.time()
         bits = w_bits # 4-bit quantization
         W = self.layer.weight.data.clone().to(dtype)
         device = W.device
@@ -221,6 +224,7 @@ class GPTQ:
         del H
         del W
         torch.cuda.empty_cache()
+        print(f"Time taken to fasterquant for {self.name}: {time.time() - t0_fasterquant} seconds")
 
     def free(self):
         self.H = None
@@ -713,6 +717,9 @@ class SMGPTQ():
         
         print(out_channels)
 
+        t0 = time.time()
+        times_list = []
+
         probes = torch.randn(max_probes, self.pre_outputs.shape[1], channels.shape[0]).to(self.pre_outputs.device)
 
         JVP_scalars = (probes * self.pre_outputs[:, :, channels]/self.inputs.shape[0]).sum(dim=1).sum(dim=1) # divide by batch size to get average instead of sum
@@ -748,8 +755,13 @@ class SMGPTQ():
             print(JVP_scalars)
             rel_outs = [[c, c+1] for c in channels]
             print(rel_outs)
+            common_time = time.time() - t0
+            print(common_time)
+            for i in range(max_probes//step_size):
+                times_list.append(common_time)
             for JVP_channels, derivative_channels in zip(JVP_scalars, rel_outs):
                 l = []
+                t0 = time.time()
                 for i in range(max_probes):
                     gi_full, = torch.autograd.grad(
                         outputs=JVP_channels[i], inputs=self.layer.in_proj.weight,
@@ -760,10 +772,14 @@ class SMGPTQ():
                     gi = gi_full[derivative_channels, :]
                     # print(gi.shape)
                     l.append(gi)
+                    if (i + 1) % step_size == 0:
+                        times_list[int(i/step_size)] += time.time() - t0 
                 Gs.append(torch.stack(l, dim=0).reshape(max_probes, -1))
                 print(Gs[-1].shape)
             print()
         else:
+            common_time = time.time() - t0
+            t0 = time.time()
             for i in range(max_probes):
                 gi_full, = torch.autograd.grad(
                     outputs=JVP_scalars[i], inputs=self.layer.in_proj.weight,
@@ -772,6 +788,8 @@ class SMGPTQ():
                 )
                 gi = gi_full[channels]
                 Gs.append(gi)
+                if (i + 1) % step_size == 0:
+                    times_list.append(time.time() - t0 + common_time)
 
         G = torch.stack(Gs, dim=0)
         if tensor_name == 'b' or tensor_name == 'c':
@@ -783,7 +801,14 @@ class SMGPTQ():
         H_dict = {}
 
         for i in range(step_size, max_probes + 1, step_size):
+            # print(i)
+            # print(step_size)
+            t0 = time.time()
             H_dict[i] = (G[:i].permute(1, 2, 0) / i).bmm(G[:i].permute(1, 0, 2))
+            times_list[int(i/step_size) - 1] += time.time() - t0
+        np.save(f"jacobian_jvp_error/times/{tensor_name}/{self.idx}.npy", np.array(times_list))
+        print(times_list)
+        print(len(times_list))
         return H_dict
 
 
@@ -844,12 +869,36 @@ class SMGPTQ():
         print(probe_counts)
         errors = []
         gptq_errors = []
+
+        errors_bd = []
+        gptq_errors_bd = []
+
+        error_bar = []
+        error_bar_bd = []
+
         for i, k in enumerate(true_hessians.keys()):
             true_hessian = true_hessians[k]
+            true_hessian_block_1 = true_hessian[:true_hessian.shape[0]//2, :true_hessian.shape[1]//2]
+            true_hessian_block_2 = true_hessian[true_hessian.shape[0]//2:, true_hessian.shape[1]//2:]
+            true_hessians_bd = torch.block_diag(true_hessian_block_1, true_hessian_block_2)
             error_channel = []
+            error_channel_bd = []
+            error_bar_channel = []
+            error_bar_channel_bd = []
             for k2 in H_dict.keys():
                 estimated_hessian = H_dict[k2][i, :, :]
+                estimated_hessian_bar = H_dict[k2].mean(dim=0)
+
+                estimated_hessian_block_1 = estimated_hessian[:estimated_hessian.shape[0]//2, :estimated_hessian.shape[1]//2]
+                estimated_hessian_block_2 = estimated_hessian[estimated_hessian.shape[0]//2:, estimated_hessian.shape[1]//2:]
+                estimated_hessian_bd = torch.block_diag(estimated_hessian_block_1, estimated_hessian_block_2)
+
+                estimated_hessian_block_1_bar = estimated_hessian_bar[:estimated_hessian_bar.shape[0]//2, :estimated_hessian_bar.shape[1]//2]
+                estimated_hessian_block_2_bar = estimated_hessian_bar[estimated_hessian_bar.shape[0]//2:, estimated_hessian_bar.shape[1]//2:]
+                estimated_hessian_bd_bar = torch.block_diag(estimated_hessian_block_1_bar, estimated_hessian_block_2_bar)
+
                 true_hessian = true_hessian.to(estimated_hessian.device)
+                true_hessians_bd = true_hessians_bd.to(estimated_hessian_bd.device)
                 # print(true_hessian - estimated_hessian)
                 # print(torch.linalg.norm(true_hessian - estimated_hessian))
                 # print(torch.linalg.norm(true_hessian))
@@ -869,7 +918,29 @@ class SMGPTQ():
                     # error_item = torch.linalg.norm(true_hessian/10000 - estimated_hessian/10000)/torch.linalg.norm(true_hessian.double()/10000)
                     error_item = torch.nn.functional.cosine_similarity(true_hessian.flatten().double()/10000, estimated_hessian.flatten().double()/10000, dim=0)
                 error_channel.append(error_item)
+
+                error_item_bd = torch.nn.functional.cosine_similarity(true_hessians_bd.flatten().double(), estimated_hessian_bd.flatten().double(), dim=0)
+                if torch.isnan(error_item_bd):
+                    error_item_bd = torch.nn.functional.cosine_similarity(true_hessians_bd.flatten().double()/10000, estimated_hessian_bd.flatten().double()/10000, dim=0)
+                error_channel_bd.append(error_item_bd)
+
+                error_item_bar = torch.nn.functional.cosine_similarity(true_hessian.flatten().double(), estimated_hessian_bar.flatten().double(), dim=0)
+                if torch.isnan(error_item_bar):
+                    error_item_bar = torch.nn.functional.cosine_similarity(true_hessian.flatten().double()/10000, estimated_hessian_bar.flatten().double()/10000, dim=0)
+                error_bar_channel.append(error_item_bar)
+
+                error_item_bar_bd = torch.nn.functional.cosine_similarity(true_hessians_bd.flatten().double(), estimated_hessian_bd_bar.flatten().double(), dim=0)
+                if torch.isnan(error_item_bar_bd):
+                    error_item_bar_bd = torch.nn.functional.cosine_similarity(true_hessians_bd.flatten().double()/10000, estimated_hessian_bd_bar.flatten().double()/10000, dim=0)
+                error_bar_channel_bd.append(error_item_bar_bd)
+
             if len(error_channel) == 0:
+                continue
+            if len(error_channel_bd) == 0:
+                continue
+            if len(error_bar_channel) == 0:
+                continue
+            if len(error_bar_channel_bd) == 0:
                 continue
             if gptq_val is not None:
                 # gptq_error_item = torch.linalg.norm((gptq_val/10000 - true_hessian/10000).double())/torch.linalg.norm(true_hessian.double()/10000)
@@ -877,7 +948,12 @@ class SMGPTQ():
                     print("Inf in gptq_val!")
                 gptq_error_item = torch.nn.functional.cosine_similarity(gptq_val.flatten().double()/10000, true_hessian.flatten().double()/10000, dim=0)
                 gptq_errors.append(gptq_error_item.item())
+                gptq_error_item_bd = torch.nn.functional.cosine_similarity(gptq_val.flatten().double()/10000, true_hessians_bd.flatten().double()/10000, dim=0)
+                gptq_errors_bd.append(gptq_error_item_bd.item())
             error_channel = torch.stack(error_channel, dim=0)
+            error_channel_bd = torch.stack(error_channel_bd, dim=0)
+            error_bar_channel = torch.stack(error_bar_channel, dim=0)
+            error_bar_channel_bd = torch.stack(error_bar_channel_bd, dim=0)
             if torch.isnan(error_channel).any():
                 print(i, k)
                 print(H_dict[1024][i, :, :])
@@ -888,14 +964,37 @@ class SMGPTQ():
                 print()
             print(error_channel)
             errors.append(error_channel)
+            errors_bd.append(error_channel_bd)
+            error_bar.append(error_bar_channel)
+            error_bar_bd.append(error_bar_channel_bd)
+        
+        print(f"="*100)
         errors = torch.stack(errors, dim=0)
         np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine.npy", errors.cpu().numpy())
         errors = errors.mean(dim=0)
         print(errors)
+
+        errors_bd = torch.stack(errors_bd, dim=0)
+        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bd.npy", errors_bd.cpu().numpy())
+        errors_bd = errors_bd.mean(dim=0)
+        print(errors_bd)
+
+        error_bar = torch.stack(error_bar, dim=0)
+        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bar.npy", error_bar.cpu().numpy())
+        error_bar = error_bar.mean(dim=0)
+        print(error_bar)
+
+        error_bar_bd = torch.stack(error_bar_bd, dim=0)
+        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bar_bd.npy", error_bar_bd.cpu().numpy())
+        error_bar_bd = error_bar_bd.mean(dim=0)
+        print(error_bar_bd)
+
         if gptq_val is not None:
             print(gptq_errors)
+            print(gptq_errors_bd)
             print(len(gptq_errors))
             np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_cosine.npy", np.array(gptq_errors))
+            np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_cosine_bd.npy", np.array(gptq_errors_bd))
         plt.plot(probe_counts, errors.cpu().numpy())
         plt.xlabel('Probe Count')
         plt.ylabel('Error')
@@ -907,6 +1006,8 @@ class SMGPTQ():
             # print horizontal line for gptq_error_mean
             gptq_error_mean = sum(gptq_errors)/len(gptq_errors)
             print(gptq_error_mean)
+            gptq_error_mean_bd = sum(gptq_errors_bd)/len(gptq_errors_bd)
+            print(gptq_error_mean_bd)
             # plt.axhline(gptq_error_mean, color='red', linestyle='--')
         plt.show()
         plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_{tensor_name}_Error.png")
@@ -914,7 +1015,7 @@ class SMGPTQ():
 
 
     def read_and_compare(self):
-        if self.idx not in [1, 4, 7, 10, 13, 16, 19, 22, 23]:
+        if self.idx not in [0, 1, 4, 7, 10, 13, 16, 19, 22, 23]:
         # if self.idx != 0:
             print("skipping layer\n")
             return
@@ -1217,71 +1318,130 @@ class SMGPTQ():
         gptq_list_b = []
         gptq_list_c = []
 
-        for layer in layers:
-            z_list.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}.npy").mean(axis=0))
-            x_list.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}.npy").mean(axis=0))
-            b_list.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}.npy").mean(axis=0))
-            c_list.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}.npy").mean(axis=0))
+        z_list_bd = []
+        x_list_bd = []
+        b_list_bd = []
+        c_list_bd = []
 
-            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq.npy")).any():
-                gptq_list_z.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq.npy"))
-            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq.npy")).any():
-                gptq_list_x.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq.npy"))
-            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq.npy")).any():
-                gptq_list_b.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq.npy"))
-            if not np.isinf(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq.npy")).any():
-                gptq_list_c.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq.npy"))
-        
+        gptq_list_z_bd = []
+        gptq_list_x_bd = []
+        gptq_list_b_bd = []
+        gptq_list_c_bd = []
+
+        for layer in layers:
+            if not np.isnan(np.load(f"jacobian_jvp_error/times/z/{layer}.npy")).any():
+                z_list.append(np.load(f"jacobian_jvp_error/times/z/{layer}.npy"))
+            if not np.isnan(np.load(f"jacobian_jvp_error/times/x/{layer}.npy")).any():
+                x_list.append(np.load(f"jacobian_jvp_error/times/x/{layer}.npy"))
+            if not np.isnan(np.load(f"jacobian_jvp_error/times/b/{layer}.npy")).any():
+                b_list.append(np.load(f"jacobian_jvp_error/times/b/{layer}.npy"))
+            if not np.isnan(np.load(f"jacobian_jvp_error/times/c/{layer}.npy")).any():
+                c_list.append(np.load(f"jacobian_jvp_error/times/c/{layer}.npy"))
+
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_cosine_bd.npy")).any():
+                z_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_cosine_bd.npy").mean(axis=0))
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_cosine_bd.npy")).any():
+                x_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_cosine_bd.npy").mean(axis=0))
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_cosine_bd.npy")).any():
+                b_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_cosine_bd.npy").mean(axis=0))
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_cosine_bd.npy")).any():
+                c_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_cosine_bd.npy").mean(axis=0))
+
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine.npy")).any():
+                gptq_list_z.extend(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine.npy")).any():
+                gptq_list_x.extend(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine.npy")).any():
+                gptq_list_b.extend(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine.npy")).any():
+                gptq_list_c.extend(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine.npy").flatten())
+
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine_bd.npy")).any():
+                gptq_list_z_bd.extend(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine_bd.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine_bd.npy")).any():
+                gptq_list_x_bd.extend(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine_bd.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine_bd.npy")).any():
+                gptq_list_b_bd.extend(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine_bd.npy").flatten())
+            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine_bd.npy")).any():
+                gptq_list_c_bd.extend(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine_bd.npy").flatten())
+
         z_list = np.stack(z_list, axis=0)
         x_list = np.stack(x_list, axis=0)
         b_list = np.stack(b_list, axis=0)
         c_list = np.stack(c_list, axis=0)
+        z_list_bd = np.stack(z_list_bd, axis=0)
+        x_list_bd = np.stack(x_list_bd, axis=0)
+        b_list_bd = np.stack(b_list_bd, axis=0)
+        c_list_bd = np.stack(c_list_bd, axis=0)
 
+        print(z_list)
 
         z_list = z_list.mean(axis=0)
         x_list = x_list.mean(axis=0)
         b_list = b_list.mean(axis=0)
         c_list = c_list.mean(axis=0)
+        z_list_bd = z_list_bd.mean(axis=0)
+        x_list_bd = x_list_bd.mean(axis=0)
+        b_list_bd = b_list_bd.mean(axis=0)
+        c_list_bd = c_list_bd.mean(axis=0)
 
         print(gptq_list_z)
+        for i in range(len(gptq_list_z)):
+            print(gptq_list_z[i])
+            print(gptq_list_z[i].shape)
+            print()
 
         gptq_mean_z = np.mean(gptq_list_z)
         gptq_mean_x = np.mean(gptq_list_x)
         gptq_mean_b = np.mean(gptq_list_b)
         gptq_mean_c = np.mean(gptq_list_c)
 
+        gptq_mean_z_bd = np.mean(gptq_list_z_bd)
+        gptq_mean_x_bd = np.mean(gptq_list_x_bd)
+        gptq_mean_b_bd = np.mean(gptq_list_b_bd)
+        gptq_mean_c_bd = np.mean(gptq_list_c_bd)
+
         print(gptq_mean_z)
         print(gptq_mean_x)
         print(gptq_mean_b)
         print(gptq_mean_c)
 
-        fig, ax1 = plt.subplots()
+        fig, ax1 = plt.subplots(figsize=(10, 6))
 
-        ax1.plot(probe_counts, z_list, label='W_z')
-        ax1.plot(probe_counts, x_list, label='W_x')
-        ax1.plot(probe_counts, b_list, label='W_b')
-        ax1.plot(probe_counts, c_list, label='W_c')
+        ax1.plot(probe_counts, z_list, label=r'$W_z$', color='red')
+        ax1.plot(probe_counts, x_list, label=r'$W_x$', color='green')
+        # ax1.plot(probe_counts, b_list, label=r'$W_b$', color='blue')
+        # ax1.plot(probe_counts, c_list, label=r'$W_c$', color='purple')
 
         ax1.set_xlabel('Probe Count (# IID Samples)')
-        ax1.set_ylabel('Error (||Estimate - True||/||True||)')
-        ax1.set_title('Error vs. Probe Count (Averaged Across 10 Layers)')
+        ax1.set_ylabel(r'Runtime for $W_z$, $W_x$ (s)')
+        ax1.set_title(r'Runtime vs. Probe Count (Averaged Across 10 Layers)', pad=10)
+
+
+
+        values = [gptq_mean_z, gptq_mean_x, gptq_mean_b, gptq_mean_c]
+        labels = [r"GPTQ $W_z$", r"GPTQ $W_x$", r"GPTQ $W_b$", r"GPTQ $W_c$"]
+        colors = ['red', 'green', 'blue', 'purple']
+
+        # for value, label, color in zip(values, labels, colors):
+        #     ax1.axhline(y=value, label=label, color=color, linestyle='--')
 
         ax2 = ax1.twinx()
-        values = [gptq_mean_z, gptq_mean_x, gptq_mean_b, gptq_mean_c]
-        labels = ["GPTQ Error W_z", "GPTQ Error W_x", "GPTQ Error W_b", "GPTQ Error W_c"]
-        colors = ['red', 'green', 'blue', 'purple']
-        for value, label, color in zip(values, labels, colors):
-            ax2.axhline(y=value, label=label, color=color, linestyle='--')
-        
-        ax2.set_ylabel('GPTQ Error (||X^T X - True||/||True||)')
+        ax2.plot(probe_counts, b_list, label=r'$W_b$', color='blue')
+        ax2.plot(probe_counts, c_list, label=r'$W_c$', color='purple')
+        ax2.set_ylabel(r'Runtime for $W_b$, $W_c$ (s)')
+
+        # for value, label, color in zip(values, labels, colors):
+        #     ax1.axhline(y=value, label=label, color=color, linestyle='--')
 
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower center', bbox_to_anchor=(0.5, 1.10), ncol=8, frameon=True, fontsize='small')
 
+        plt.subplots_adjust(top=0.82)
         plt.show()
 
-        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Stitched_Averaged.png")
+        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Stitched_Averaged_Runtime2.png", bbox_inches='tight')
 
         plt.clf()
         
