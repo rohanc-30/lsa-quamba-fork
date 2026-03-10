@@ -1,0 +1,12 @@
+executable = /home/rcherukuri/lsa-quamba-fork/scripts/submission_scripts/jvp_jacobian_estimation.sh
+arguments = state-spaces/mamba2-130m --w_bits 4 --nsamples 128
+initialdir = /home/rcherukuri/lsa-quamba-fork
+error = logs/jvp_jacobian_estimation/mamba130m.err
+output = logs/jvp_jacobian_estimation/mamba130m.out
+log = logs/jvp_jacobian_estimation/mamba130m.log
+
+request_memory = 64000
+request_cpus = 8
+request_gpus = 1
+requirements = TARGET.CUDACapability >= 8.0
+queue

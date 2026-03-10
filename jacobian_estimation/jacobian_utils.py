@@ -31,11 +31,21 @@ logger = logging.getLogger(__name__)
 def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba", 
                          nsamples=128, seqlen=1024, output_dir="./jacobian_jvp_error"):
     """
-    Compute and save Jacobian samples for Mamba model layers using JVP estimation.
+    Compute Jacobian/Hessian estimates for Mamba model layers using JVP estimation.
 
-    This function performs forward passes on calibration data and captures
-    Jacobian information at each layer using the SMGPTQ (State-space Model GPTQ)
-    approach. The results are saved to disk for analysis.
+    This function performs forward passes on calibration data, captures layer
+    inputs/outputs, computes JVP-based Hessian estimates, and generates plots
+    comparing different aggregation methods. Results are saved to disk.
+
+    Workflow:
+    ---------
+    1. Capture calibration inputs from forward passes
+    2. For each layer:
+       - Load true Jacobian shards from disk
+       - Compute JVP-based Hessian estimates
+       - Save error metrics (cosine similarity) for different aggregations
+       - Save timing data
+    3. After final layer (23), generate aggregated plots across all layers
 
     Parameters:
     -----------
@@ -63,10 +73,10 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
 
     Notes:
     ------
-    - This function raises ValueError("Jacobian loop over!") when complete,
-      which is the expected behavior to signal completion.
-    - Results are saved to the output_dir in the format expected by
-      SMGPTQ.stitch_plots() for visualization.
+    - Expects Jacobian shards to already exist at ../jacobian_block_samples/130m/
+    - Saves error metrics to {output_dir}/raw_data/{component}/{layer}_{metric}.npy
+    - Saves timing data to {output_dir}/times/{component}/{layer}.npy
+    - Generates aggregated plots to {output_dir}/Aggregated_*.png
     """
     bits = w_bits
     assert bits in [4, 8], "Only support 4 or 8 bits weights for now"
@@ -186,7 +196,12 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         logging.info(f"Computing Jacobian estimates for layer {i}...")
         for name in jacobian_estimator.keys():
             logging.debug(f"Processing layer.{i}.mixer.{name} with {bits} bits")
-            jacobian_estimator[name].stitch_plots()  # This saves data to output_dir
+            # Process component Jacobians, compute JVP estimates, and save numpy arrays
+            jacobian_estimator[name].read_and_compare()
+            # Generate aggregated plots on the last processed layer
+            if i == 23:
+                logging.info("Generating aggregated plots across all layers...")
+                jacobian_estimator[name].create_all_plots(step_size=4, max_probes=64)
             jacobian_estimator[name].free()
         del jacobian_estimator
         
@@ -254,7 +269,3 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
     logging.info("Jacobian estimation complete!")
     logging.info(f"Results saved to: {output_dir}")
     logging.info("="*80)
-    
-    # Raise ValueError to signal completion (expected behavior)
-    raise ValueError("Jacobian loop over!")
-

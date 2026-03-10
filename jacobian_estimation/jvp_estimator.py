@@ -48,6 +48,59 @@ class MambaJacobianEstimator:
         # Then call estimator.stitch_plots() to compute and visualize results
     """
     
+    # ========================================================================
+    # Centralized Error Metric Configuration
+    # ========================================================================
+    # Error metrics are computed as a cartesian product of:
+    #   1. Matrix representations (full vs block-diagonal)
+    #   2. Aggregation methods (per-channel vs mean)
+    #
+    # To add a new variant:
+    #   1. Add to _get_matrix_transforms() or _get_aggregation_functions()
+    #   2. Add label to _get_matrix_labels() or _get_aggregation_labels()
+    #   3. Everything else (saving, loading, plotting) updates automatically
+    # ========================================================================
+    
+    def _get_matrix_transforms(self):
+        """
+        Get dictionary mapping matrix representation suffixes to transform functions.
+        
+        Returns:
+            dict: {suffix: transform_function}
+        """
+        return {
+            '': lambda x: x,                    # full matrix (identity)
+            '_bd': self._make_block_diagonal    # block diagonal
+        }
+    
+    def _get_aggregation_functions(self):
+        """
+        Get dictionary mapping aggregation suffixes to aggregation functions.
+        
+        Returns:
+            dict: {suffix: aggregation_function}
+        """
+        return {
+            '': self._per_channel_aggregation,  # per-channel
+            '_bar': self._mean_aggregation      # mean across channels
+        }
+    
+    @staticmethod
+    def _get_matrix_labels():
+        """Get human-readable labels for matrix representations (for plotting)."""
+        return {
+            '': 'Full Matrix',
+            '_bd': 'Block Diagonal',
+        }
+    
+    @staticmethod
+    def _get_aggregation_labels():
+        """Get human-readable labels for aggregation methods (for plotting)."""
+        return {
+            '': 'Per-Channel',
+            '_bar': 'Mean',
+        }
+    
     def __init__(self, layer, idx=0):
         """
         Initialize the Jacobian estimator for a Mamba mixer layer.
@@ -128,18 +181,10 @@ class MambaJacobianEstimator:
             tuple: (z_shards, x_shards, b_shards, c_shards) containing
                    Jacobian data for each component
         """
-        path = f'../jacobian_block_samples/130m/layer{self.idx}'
-        zpath = os.path.join(path, f"z.safetensors")
-        xpath = os.path.join(path, f"x.safetensors")
-        bpath = os.path.join(path, f"b.safetensors")
-        cpath = os.path.join(path, f"c.safetensors")
-        
-        z_shards = load_file(zpath)
-        x_shards = load_file(xpath)
-        b_shards = load_file(bpath)
-        c_shards = load_file(cpath)
-        
-        return z_shards, x_shards, b_shards, c_shards
+        base_path = f'../jacobian_block_samples/130m/layer{self.idx}'
+        components = ['z', 'x', 'b', 'c']
+        return tuple(load_file(os.path.join(base_path, f"{comp}.safetensors")) 
+                     for comp in components)
     
     def int_keys(self, tensor_shard):
         """
@@ -173,14 +218,8 @@ class MambaJacobianEstimator:
         Returns:
             dict: Hessian matrices keyed by channel
         """
-        hessian_shard = {}
-        
-        def flatten_shard(tensor_shard):
-            return torch.stack(list(tensor_shard.values()), dim=0)
-        
-        flattened_shard = flatten_shard(tensor_shard)
-        
-        # Flatten if needed
+        # Stack and flatten Jacobian shards
+        flattened_shard = torch.stack(list(tensor_shard.values()), dim=0)
         if len(flattened_shard.shape) > 3:
             flattened_shard = flattened_shard.reshape(
                 flattened_shard.shape[0], flattened_shard.shape[1], -1
@@ -189,27 +228,23 @@ class MambaJacobianEstimator:
         # Compute Hessian: H = J^T J (batched matrix multiplication)
         hessian_tensor = flattened_shard.transpose(1, 2).bmm(flattened_shard)
         
-        # Map to output dictionary
-        for i, key in enumerate(tensor_shard.keys()):
-            print(i, key)
-            print(self.layer.d_state * self.layer.ngroups)
-            print(key % (self.layer.d_state * self.layer.ngroups))
-            print(hessian_shard.keys())
-            print()
-            
-            # Special handling for b and c components (grouped structure)
-            if (tensor_name == 'b' or tensor_name == 'c') and \
-               key % ((self.layer.d_state * self.layer.ngroups)/2) in hessian_shard.keys():
-                hessian_shard[int(key % ((self.layer.d_state * self.layer.ngroups)/2))] += \
-                    hessian_tensor[i, :, :]
-            else:
-                if (tensor_name == 'b' or tensor_name == 'c'):
-                    hessian_shard[int(key % ((self.layer.d_state * self.layer.ngroups)/2))] = \
-                        hessian_tensor[i, :, :]
-                else:
-                    hessian_shard[key] = hessian_tensor[i, :, :]
+        # Map Hessian tensors back to dictionary
+        hessian_shard = {}
+        is_grouped = tensor_name in ('b', 'c')
+        group_size = int((self.layer.d_state * self.layer.ngroups) / 2) if is_grouped else None
         
-        print(hessian_shard.keys())
+        for i, key in enumerate(tensor_shard.keys()):
+            # For b/c components, use modulo to aggregate across groups
+            hessian_key = int(key % group_size) if is_grouped else key
+            hessian_value = hessian_tensor[i, :, :]
+            
+            # Accumulate if key already exists, otherwise create new entry
+            if hessian_key in hessian_shard:
+                hessian_shard[hessian_key] += hessian_value
+            else:
+                hessian_shard[hessian_key] = hessian_value
+        
+        # Sanity check
         if max(hessian_shard.keys()) > 3372:
             raise ValueError("Hessian keys are greater than d_inner!")
         
@@ -240,131 +275,147 @@ class MambaJacobianEstimator:
         Returns:
             dict: Hessian estimates keyed by number of probes used
         """
-        channels = torch.tensor(list(tensor_shard.keys()))
-        print(channels)
+        out_channels = torch.tensor(list(tensor_shard.keys()))
+        is_grouped = tensor_name in ('b', 'c')
         
-        out_channels = channels
-        print(out_channels)
+        # Map out_channels to in_proj weight indices based on component type
+        channel_offsets = {'z': 0, 'x': self.layer.d_inner, 
+                          'b': 2 * self.layer.d_inner,
+                          'c': 2 * self.layer.d_inner + self.layer.d_state * self.layer.ngroups}
+        in_proj_channels = out_channels + channel_offsets.get(tensor_name, 0)
         
-        t0 = time.time()
+        # Compute gradients using JVP
+        start_time = time.time()
         times_list = []
+        gradients = []
         
-        # Generate random probe vectors
-        probes = torch.randn(max_probes, self.pre_outputs.shape[1], channels.shape[0])
-        probes = probes.to(self.pre_outputs.device)
-        
-        # Compute JVP scalars: probe · pre_outputs
-        JVP_scalars = (probes * self.pre_outputs[:, :, channels] / self.inputs.shape[0])
-        JVP_scalars = JVP_scalars.sum(dim=1).sum(dim=1)
-        
-        Gs = []
-        
-        # Map channels to in_proj indices based on component
-        if tensor_name == 'x':
-            channels = channels + self.layer.d_inner
-        elif tensor_name == 'b':
-            channels = channels + 2 * self.layer.d_inner
-        elif tensor_name == 'c':
-            channels = channels + 2 * self.layer.d_inner + \
-                      self.layer.d_state * self.layer.ngroups
-        
-        print(channels)
-        
-        # Special handling for b and c components (grouped across heads)
-        if tensor_name == 'b' or tensor_name == 'c':
-            for c in channels:
-                print(c)
+        if is_grouped:
+            # Special handling for b and c: replicate across heads
+            times_list = [time.time() - start_time] * (max_probes // step_size)
+            derivative_channels_list = [[c, c+1] for c in in_proj_channels]
             
-            JVP_scalars = []
-            for o in out_channels:
-                print(o)
-                # Replicate across all heads
-                all_heads = torch.arange(self.layer.nheads) * (self.layer.headdim)
-                out_channels_this_head = all_heads + o
-                print(out_channels_this_head)
+            for out_ch, deriv_channels in zip(out_channels, derivative_channels_list):
+                # Compute output channels for all heads
+                head_offsets = torch.arange(self.layer.nheads) * self.layer.headdim
+                out_channels_all_heads = head_offsets + out_ch
                 
+                # Generate probes and compute JVP scalars for this channel
                 probes = torch.randn(max_probes, self.pre_outputs.shape[1], 
-                                    out_channels_this_head.shape[0])
-                probes = probes.to(self.pre_outputs.device)
+                                    len(out_channels_all_heads), device=self.pre_outputs.device)
+                jvp_scalars = (probes * self.pre_outputs[:, :, out_channels_all_heads] / 
+                              self.inputs.shape[0]).sum(dim=1).sum(dim=1)
                 
-                JVP_scalars.append(
-                    (probes * self.pre_outputs[:, :, out_channels_this_head] / 
-                     self.inputs.shape[0]).sum(dim=1).sum(dim=1)
-                )
-            
-            print(len(JVP_scalars))
-            print(JVP_scalars[0].shape)
-            print(JVP_scalars)
-            
-            rel_outs = [[c, c+1] for c in channels]
-            print(rel_outs)
-            
-            common_time = time.time() - t0
-            print(common_time)
-            
-            for i in range(max_probes // step_size):
-                times_list.append(common_time)
-            
-            # Compute gradients for each JVP scalar
-            for JVP_channels, derivative_channels in zip(JVP_scalars, rel_outs):
-                l = []
-                t0 = time.time()
+                # Compute gradients for each probe
+                channel_gradients = []
+                grad_start_time = time.time()
                 for i in range(max_probes):
-                    gi_full, = torch.autograd.grad(
-                        outputs=JVP_channels[i],
+                    grad_full, = torch.autograd.grad(
+                        outputs=jvp_scalars[i],
                         inputs=self.layer.in_proj.weight,
                         retain_graph=True,
                         create_graph=False,
                     )
-                    gi = gi_full[derivative_channels, :]
-                    l.append(gi)
+                    channel_gradients.append(grad_full[deriv_channels, :])
                     
                     if (i + 1) % step_size == 0:
-                        times_list[int(i / step_size)] += time.time() - t0
+                        times_list[(i + 1) // step_size - 1] += time.time() - grad_start_time
                 
-                Gs.append(torch.stack(l, dim=0).reshape(max_probes, -1))
-                print(Gs[-1].shape)
-            print()
+                gradients.append(torch.stack(channel_gradients, dim=0).reshape(max_probes, -1))
         else:
-            # For z and x components
-            common_time = time.time() - t0
-            t0 = time.time()
+            # For z and x components: standard JVP computation
+            common_time = time.time() - start_time
             
+            # Generate probes and compute JVP scalars
+            probes = torch.randn(max_probes, self.pre_outputs.shape[1], 
+                                len(out_channels), device=self.pre_outputs.device)
+            jvp_scalars = (probes * self.pre_outputs[:, :, out_channels] / 
+                          self.inputs.shape[0]).sum(dim=1).sum(dim=1)
+            
+            # Compute gradients for each probe
+            grad_start_time = time.time()
             for i in range(max_probes):
-                gi_full, = torch.autograd.grad(
-                    outputs=JVP_scalars[i],
+                grad_full, = torch.autograd.grad(
+                    outputs=jvp_scalars[i],
                     inputs=self.layer.in_proj.weight,
                     retain_graph=True,
                     create_graph=False,
                 )
-                gi = gi_full[channels]
-                Gs.append(gi)
+                gradients.append(grad_full[in_proj_channels])
                 
                 if (i + 1) % step_size == 0:
-                    times_list.append(time.time() - t0 + common_time)
+                    times_list.append(time.time() - grad_start_time + common_time)
         
-        # Stack gradients
-        G = torch.stack(Gs, dim=0)
-        if tensor_name == 'b' or tensor_name == 'c':
+        # Stack and transpose gradients
+        G = torch.stack(gradients, dim=0)
+        if is_grouped:
             G = G.transpose(0, 1)
-        print(G.shape)
-        
         G = G.float()
         
         # Compute Hessian estimates for different probe counts
         H_dict = {}
-        for i in range(step_size, max_probes + 1, step_size):
-            t0 = time.time()
-            H_dict[i] = (G[:i].permute(1, 2, 0) / i).bmm(G[:i].permute(1, 0, 2))
-            times_list[int(i / step_size) - 1] += time.time() - t0
+        for num_probes in range(step_size, max_probes + 1, step_size):
+            hessian_start = time.time()
+            H_dict[num_probes] = (G[:num_probes].permute(1, 2, 0) / num_probes).bmm(
+                G[:num_probes].permute(1, 0, 2))
+            times_list[num_probes // step_size - 1] += time.time() - hessian_start
         
         # Save timing information
         np.save(f"jacobian_jvp_error/times/{tensor_name}/{self.idx}.npy", 
                 np.array(times_list))
-        print(times_list)
-        print(len(times_list))
         
         return H_dict
+    
+    def _make_block_diagonal(self, tensor):
+        """Create block diagonal matrix from halves of input tensor."""
+        mid = tensor.shape[0] // 2
+        block_1 = tensor[:mid, :mid]
+        block_2 = tensor[mid:, mid:]
+        return torch.block_diag(block_1, block_2)
+    
+    def _robust_cosine_similarity(self, tensor1, tensor2):
+        """Compute cosine similarity with NaN handling and rescaling."""
+        similarity = torch.nn.functional.cosine_similarity(
+            tensor1.flatten().double(),
+            tensor2.flatten().double(),
+            dim=0
+        )
+        # Rescale if NaN (typically due to numerical issues)
+        if torch.isnan(similarity):
+            similarity = torch.nn.functional.cosine_similarity(
+                tensor1.flatten().double() / 10000,
+                tensor2.flatten().double() / 10000,
+                dim=0
+            )
+        return similarity
+    
+    def _save_error_data(self, errors, suffix, tensor_name):
+        """Save error data to disk and return mean."""
+        stacked = torch.stack(errors, dim=0)
+        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_{suffix}.npy",
+                stacked.cpu().numpy())
+        return stacked.mean(dim=0)
+    
+    # Hessian aggregation functions for H_dict
+    @staticmethod
+    def _per_channel_aggregation(H_dict, probe_count, channel_idx):
+        """Return the hessian for a specific channel (identity aggregation)."""
+        return H_dict[probe_count][channel_idx, :, :]
+    
+    @staticmethod
+    def _mean_aggregation(H_dict, probe_count, channel_idx):
+        """Return the mean hessian across all channels."""
+        return H_dict[probe_count].mean(dim=0)
+    
+    def get_all_metric_names(self):
+        """
+        Generate all metric names from the cartesian product.
+        
+        Returns:
+            list: All metric names (e.g., ['cosine', 'cosine_bd', 'cosine_bar', 'cosine_bar_bd'])
+        """
+        return [f"cosine{mat_suffix}{agg_suffix}" 
+                for mat_suffix in self._get_matrix_transforms().keys()
+                for agg_suffix in self._get_aggregation_functions().keys()]
     
     def plot_hessian_estimations(self, true_hessians, H_dict, gptq_val=None, 
                                  tensor_name=None):
@@ -374,6 +425,10 @@ class MambaJacobianEstimator:
         Compares the JVP-estimated Hessians against ground truth Hessians
         computed from full Jacobians. Plots cosine similarity as the error metric.
         
+        The error computation is structured as a cartesian product of:
+        1. Matrix representations (full vs block-diagonal)
+        2. Aggregation functions (per-channel vs mean across channels)
+        
         Parameters:
             true_hessians (dict): Ground truth Hessian matrices
             H_dict (dict): Estimated Hessians keyed by probe count
@@ -381,214 +436,128 @@ class MambaJacobianEstimator:
             tensor_name (str): Component name for plot labels
         """
         probe_counts = list(H_dict.keys())
-        print(probe_counts)
         
-        errors = []
-        gptq_errors = []
-        errors_bd = []
-        gptq_errors_bd = []
-        error_bar = []
-        error_bar_bd = []
+        # Get transformation and aggregation functions from centralized config
+        matrix_representations = self._get_matrix_transforms()
+        aggregation_functions = self._get_aggregation_functions()
         
-        for i, k in enumerate(true_hessians.keys()):
-            true_hessian = true_hessians[k]
+        # Generate all error keys from cartesian product
+        error_keys = self.get_all_metric_names()
+        error_collectors = {key: [] for key in error_keys}
+        
+        # GPTQ only varies by matrix representation (not by aggregation)
+        gptq_error_keys = [f"cosine{mat_suffix}" for mat_suffix in matrix_representations.keys()]
+        gptq_errors = {key: [] for key in gptq_error_keys}
+        
+        for channel_idx, channel_key in enumerate(true_hessians.keys()):
+            true_hessian_full = true_hessians[channel_key]
             
-            # Create block diagonal version
-            true_hessian_block_1 = true_hessian[:true_hessian.shape[0]//2, 
-                                               :true_hessian.shape[1]//2]
-            true_hessian_block_2 = true_hessian[true_hessian.shape[0]//2:, 
-                                               true_hessian.shape[1]//2:]
-            true_hessians_bd = torch.block_diag(true_hessian_block_1, 
-                                                true_hessian_block_2)
-            
-            error_channel = []
-            error_channel_bd = []
-            error_bar_channel = []
-            error_bar_channel_bd = []
-            
-            for k2 in H_dict.keys():
-                estimated_hessian = H_dict[k2][i, :, :]
-                estimated_hessian_bar = H_dict[k2].mean(dim=0)
-                
-                # Create block diagonal versions of estimates
-                estimated_hessian_block_1 = estimated_hessian[:estimated_hessian.shape[0]//2,
-                                                             :estimated_hessian.shape[1]//2]
-                estimated_hessian_block_2 = estimated_hessian[estimated_hessian.shape[0]//2:,
-                                                             estimated_hessian.shape[1]//2:]
-                estimated_hessian_bd = torch.block_diag(estimated_hessian_block_1,
-                                                       estimated_hessian_block_2)
-                
-                estimated_hessian_block_1_bar = estimated_hessian_bar[:estimated_hessian_bar.shape[0]//2,
-                                                                     :estimated_hessian_bar.shape[1]//2]
-                estimated_hessian_block_2_bar = estimated_hessian_bar[estimated_hessian_bar.shape[0]//2:,
-                                                                     estimated_hessian_bar.shape[1]//2:]
-                estimated_hessian_bd_bar = torch.block_diag(estimated_hessian_block_1_bar,
-                                                           estimated_hessian_block_2_bar)
-                
-                true_hessian = true_hessian.to(estimated_hessian.device)
-                true_hessians_bd = true_hessians_bd.to(estimated_hessian_bd.device)
-                
-                # Check for infinities
-                if torch.isinf(estimated_hessian).any():
-                    print("Inf in estimated hessian!")
-                if torch.isinf(true_hessian).any():
-                    print("Inf in true hessian!")
-                    continue
-                if torch.linalg.norm(true_hessian).isinf():
-                    print(torch.linalg.norm(true_hessian.double()))
-                    print(torch.linalg.norm(true_hessian.double()/10000))
-                    print()
-                
-                # Compute cosine similarity as error metric
-                error_item = torch.nn.functional.cosine_similarity(
-                    true_hessian.flatten().double(),
-                    estimated_hessian.flatten().double(),
-                    dim=0
-                )
-                if torch.isnan(error_item):
-                    error_item = torch.nn.functional.cosine_similarity(
-                        true_hessian.flatten().double()/10000,
-                        estimated_hessian.flatten().double()/10000,
-                        dim=0
-                    )
-                error_channel.append(error_item)
-                
-                error_item_bd = torch.nn.functional.cosine_similarity(
-                    true_hessians_bd.flatten().double(),
-                    estimated_hessian_bd.flatten().double(),
-                    dim=0
-                )
-                if torch.isnan(error_item_bd):
-                    error_item_bd = torch.nn.functional.cosine_similarity(
-                        true_hessians_bd.flatten().double()/10000,
-                        estimated_hessian_bd.flatten().double()/10000,
-                        dim=0
-                    )
-                error_channel_bd.append(error_item_bd)
-                
-                error_item_bar = torch.nn.functional.cosine_similarity(
-                    true_hessian.flatten().double(),
-                    estimated_hessian_bar.flatten().double(),
-                    dim=0
-                )
-                if torch.isnan(error_item_bar):
-                    error_item_bar = torch.nn.functional.cosine_similarity(
-                        true_hessian.flatten().double()/10000,
-                        estimated_hessian_bar.flatten().double()/10000,
-                        dim=0
-                    )
-                error_bar_channel.append(error_item_bar)
-                
-                error_item_bar_bd = torch.nn.functional.cosine_similarity(
-                    true_hessians_bd.flatten().double(),
-                    estimated_hessian_bd_bar.flatten().double(),
-                    dim=0
-                )
-                if torch.isnan(error_item_bar_bd):
-                    error_item_bar_bd = torch.nn.functional.cosine_similarity(
-                        true_hessians_bd.flatten().double()/10000,
-                        estimated_hessian_bd_bar.flatten().double()/10000,
-                        dim=0
-                    )
-                error_bar_channel_bd.append(error_item_bar_bd)
-            
-            # Skip if no valid errors
-            if len(error_channel) == 0 or len(error_channel_bd) == 0 or \
-               len(error_bar_channel) == 0 or len(error_bar_channel_bd) == 0:
+            # Check for infinities and skip if found
+            if torch.isinf(true_hessian_full).any():
                 continue
             
-            # Compare with GPTQ if provided
-            if gptq_val is not None:
-                if torch.isinf(gptq_val).any():
-                    print("Inf in gptq_val!")
-                gptq_error_item = torch.nn.functional.cosine_similarity(
-                    gptq_val.flatten().double()/10000,
-                    true_hessian.flatten().double()/10000,
-                    dim=0
-                )
-                gptq_errors.append(gptq_error_item.item())
+            # Track errors for this channel across all probe counts
+            channel_errors = {key: [] for key in error_keys}
+            
+            for probe_count in probe_counts:
+                # Move to correct device
+                device = H_dict[probe_count].device
+                true_hessian_full = true_hessian_full.to(device)
                 
-                gptq_error_item_bd = torch.nn.functional.cosine_similarity(
-                    gptq_val.flatten().double()/10000,
-                    true_hessians_bd.flatten().double()/10000,
-                    dim=0
-                )
-                gptq_errors_bd.append(gptq_error_item_bd.item())
+                # Compute errors for all combinations (cartesian product)
+                for mat_suffix, mat_fn in matrix_representations.items():
+                    for agg_suffix, agg_fn in aggregation_functions.items():
+                        # Apply matrix representation to true hessian
+                        true_hessian = mat_fn(true_hessian_full)
+                        
+                        # Apply aggregation function to estimated hessian
+                        estimated = agg_fn(H_dict, probe_count, channel_idx)
+                        
+                        # Apply matrix representation to estimated hessian
+                        estimated = mat_fn(estimated)
+                        
+                        # Compute error and store
+                        error_key = f"cosine{mat_suffix}{agg_suffix}"
+                        error = self._robust_cosine_similarity(true_hessian, estimated)
+                        channel_errors[error_key].append(error)
             
-            error_channel = torch.stack(error_channel, dim=0)
-            error_channel_bd = torch.stack(error_channel_bd, dim=0)
-            error_bar_channel = torch.stack(error_bar_channel, dim=0)
-            error_bar_channel_bd = torch.stack(error_bar_channel_bd, dim=0)
+            # Skip if no valid errors for this channel
+            if not all(channel_errors.values()):
+                continue
             
-            if torch.isnan(error_channel).any():
-                print(i, k)
-                print(H_dict[1024][i, :, :])
-                print(true_hessian)
-                print(H_dict[1024][i, :, :].isnan().any())
-                print(true_hessian.isnan().any())
-                print(torch.linalg.norm(true_hessian))
-                print()
+            # Compute GPTQ errors if provided
+            if gptq_val is not None:
+                gptq_val = gptq_val.to(true_hessian_full.device)
+                for mat_suffix, mat_fn in matrix_representations.items():
+                    true_hessian = mat_fn(true_hessian_full)
+                    gptq_key = f"cosine{mat_suffix}"
+                    gptq_errors[gptq_key].append(
+                        self._robust_cosine_similarity(gptq_val, true_hessian).item())
             
-            print(error_channel)
-            errors.append(error_channel)
-            errors_bd.append(error_channel_bd)
-            error_bar.append(error_bar_channel)
-            error_bar_bd.append(error_bar_channel_bd)
+            # Stack and accumulate errors across channels
+            for key in error_keys:
+                error_collectors[key].append(torch.stack(channel_errors[key], dim=0))
         
-        # Aggregate and save results
-        print(f"="*100)
-        errors = torch.stack(errors, dim=0)
-        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine.npy",
-                errors.cpu().numpy())
-        errors = errors.mean(dim=0)
-        print(errors)
+        # Check if any channels were successfully processed
+        if not any(error_collectors.values()):
+            print(f"Warning: No valid channels processed for {tensor_name} in layer {self.idx}")
+            return
         
-        errors_bd = torch.stack(errors_bd, dim=0)
-        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bd.npy",
-                errors_bd.cpu().numpy())
-        errors_bd = errors_bd.mean(dim=0)
-        print(errors_bd)
-        
-        error_bar = torch.stack(error_bar, dim=0)
-        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bar.npy",
-                error_bar.cpu().numpy())
-        error_bar = error_bar.mean(dim=0)
-        print(error_bar)
-        
-        error_bar_bd = torch.stack(error_bar_bd, dim=0)
-        np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_cosine_bar_bd.npy",
-                error_bar_bd.cpu().numpy())
-        error_bar_bd = error_bar_bd.mean(dim=0)
-        print(error_bar_bd)
+        # Aggregate, save, and print all error types
+        print("=" * 100)
+        error_means = {}
+        for key, errors in error_collectors.items():
+            if errors:  # Only process non-empty error lists
+                error_means[key] = self._save_error_data(errors, key, tensor_name)
+                print(f"{key}: {error_means[key]}")
         
         # Save GPTQ comparisons
         if gptq_val is not None:
-            print(gptq_errors)
-            print(gptq_errors_bd)
-            print(len(gptq_errors))
-            np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_cosine.npy",
-                    np.array(gptq_errors))
-            np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_cosine_bd.npy",
-                    np.array(gptq_errors_bd))
+            for key, errors in gptq_errors.items():
+                if errors:  # Only save if we have data
+                    np.save(f"jacobian_jvp_error/raw_data/{tensor_name}/{self.idx}_gptq_{key}.npy",
+                            np.array(errors))
+                    print(f"GPTQ {key} mean: {np.mean(errors)}")
         
-        # Create plot
-        plt.plot(probe_counts, errors.cpu().numpy())
-        plt.xlabel('Probe Count')
-        plt.ylabel('Error')
-        title = f'Error vs. Probe Count in Layer {self.idx}'
-        if tensor_name is not None:
-            title += f' for {tensor_name}'
-        plt.title(title)
+        # Create and save plot (using the first error key by default)
+        if error_means:
+            primary_error_key = list(error_means.keys())[0]
+            plt.plot(probe_counts, error_means[primary_error_key].cpu().numpy())
+            plt.xlabel('Probe Count')
+            plt.ylabel('Error (Cosine Similarity)')
+            plt.title(f'Error vs. Probe Count in Layer {self.idx}' + 
+                     (f' for {tensor_name}' if tensor_name else ''))
+            plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_{tensor_name}_Error.png")
+            plt.show()
+            plt.clf()
+    
+    def _process_component(self, shard, component_name, gptq_val, max_probes=1024, step_size=8):
+        """
+        Process a single component (z, x, b, or c) through the full pipeline.
         
-        if gptq_val is not None:
-            gptq_error_mean = sum(gptq_errors)/len(gptq_errors)
-            print(gptq_error_mean)
-            gptq_error_mean_bd = sum(gptq_errors_bd)/len(gptq_errors_bd)
-            print(gptq_error_mean_bd)
+        Parameters:
+            shard (dict): Raw Jacobian shard data
+            component_name (str): Name of component ('z', 'x', 'b', or 'c')
+            gptq_val: GPTQ Hessian approximation for comparison
+            max_probes (int): Number of JVP probe vectors
+            step_size (int): Increment for intermediate results
+        """
+        # Convert shard keys and compute Hessian
+        shard = self.int_keys(shard)
+        hessian = self.convert_to_hessian(shard, tensor_name=component_name)
         
-        plt.show()
-        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Layer_{self.idx}_{tensor_name}_Error.png")
-        plt.clf()
+        # Compute JVP-based Hessian estimates
+        jvp_gradients = self.jvp_gradients_and_hessian_slow(
+            hessian, max_probes=max_probes, step_size=step_size, tensor_name=component_name
+        )
+        
+        # Plot and save results
+        self.plot_hessian_estimations(hessian, jvp_gradients, 
+                                      gptq_val=gptq_val, tensor_name=component_name)
+        
+        # Clean up memory
+        del shard, hessian, jvp_gradients
+        self.free()
     
     def read_and_compare(self):
         """
@@ -610,300 +579,221 @@ class MambaJacobianEstimator:
         print(self.inputs.shape)
         
         # Compute GPTQ-style Hessian approximation for comparison
-        comb_inp = self.inputs.mean(dim=0)
+        comb_inp = self.inputs.mean(dim=0).float()
         if torch.isinf(comb_inp).any() or torch.isnan(comb_inp).any():
-            print("Comb inp broke!!")
-            raise ValueError("ERROR!!")
-        comb_inp = comb_inp.float()
+            raise ValueError("Invalid values in input: inf or nan detected")
         
-        gptq_parallel = (self.inputs.transpose(1, 2).bmm(self.inputs)).mean(dim=0)
         gptq_aggregated = comb_inp.T @ comb_inp
-        print(gptq_parallel.shape)
-        print(gptq_aggregated.shape)
-        print(gptq_parallel)
-        print(gptq_aggregated)
-        print()
+        gptq_block_diag = torch.block_diag(gptq_aggregated, gptq_aggregated)
         
-        # Split fused W into individual weight matrices as per mamba2
-        W_z = self.layer.in_proj.weight[:self.layer.d_inner, :]
-        W_x = self.layer.in_proj.weight[self.layer.d_inner:2 * self.layer.d_inner, :]
-        W_b = self.layer.in_proj.weight[
-            2 * self.layer.d_inner:
-            2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state, :
-        ]
-        W_c = self.layer.in_proj.weight[
-            2 * self.layer.d_inner + self.layer.ngroups * self.layer.d_state:
-            2 * self.layer.d_inner + 2 * self.layer.ngroups * self.layer.d_state, :
-        ]
-        W_t = self.layer.in_proj.weight[-self.layer.nheads:, :]
-        
-        # Load and process each component (z, x, b, c)
+        # Load Jacobian shards for all components
         z_shards, x_shards, b_shards, c_shards = self.read_shards()
         
-        # Process z component
-        z_shards = self.int_keys(z_shards)
-        z_hessian = self.convert_to_hessian(z_shards)
-        z_jvp_gradients = self.jvp_gradients_and_hessian_slow(
-            z_hessian, max_probes=1024, step_size=8, tensor_name='z'
-        )
+        # Process each component with appropriate GPTQ baseline
+        component_specs = [
+            (z_shards, 'z', gptq_aggregated),
+            (x_shards, 'x', gptq_aggregated),
+            (b_shards, 'b', gptq_block_diag),
+            (c_shards, 'c', gptq_block_diag),
+        ]
         
-        print("True Hessian:")
-        print(z_hessian[0])
-        print()
-        
-        print("Estimated Hessians:")
-        for k in z_jvp_gradients.keys():
-            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
-                continue
-            print(k)
-            print(z_jvp_gradients[k][0, :, :])
-            print()
-        
-        self.plot_hessian_estimations(z_hessian, z_jvp_gradients, 
-                                      gptq_val=gptq_aggregated, tensor_name='z')
-        
-        del z_shards, z_hessian, z_jvp_gradients
-        self.free()
-        
-        # Process x component
-        x_shards = self.int_keys(x_shards)
-        x_hessian = self.convert_to_hessian(x_shards)
-        x_jvp_gradients = self.jvp_gradients_and_hessian_slow(
-            x_hessian, max_probes=1024, step_size=8, tensor_name='x'
-        )
-        
-        print("True Hessian:")
-        print(x_hessian[0])
-        print()
-        
-        print("Estimated Hessians:")
-        for k in x_jvp_gradients.keys():
-            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
-                continue
-            print(k)
-            print(x_jvp_gradients[k][0, :, :])
-            print()
-        
-        self.plot_hessian_estimations(x_hessian, x_jvp_gradients,
-                                      gptq_val=gptq_aggregated, tensor_name='x')
-        
-        del x_shards, x_hessian, x_jvp_gradients
-        self.free()
-        
-        # Process b component
-        b_shards = self.int_keys(b_shards)
-        b_hessian = self.convert_to_hessian(b_shards, tensor_name='b')
-        b_jvp_gradients = self.jvp_gradients_and_hessian_slow(
-            b_hessian, max_probes=1024, step_size=8, tensor_name='b'
-        )
-        
-        print("True Hessian:")
-        print(b_hessian[0])
-        print()
-        
-        print("Estimated Hessians:")
-        for k in b_jvp_gradients.keys():
-            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
-                continue
-            print(k)
-            print(b_jvp_gradients[k][0, :, :])
-            print()
-        
-        self.plot_hessian_estimations(b_hessian, b_jvp_gradients,
-                                      gptq_val=torch.block_diag(gptq_aggregated, gptq_aggregated),
-                                      tensor_name='b')
-        
-        del b_shards, b_hessian, b_jvp_gradients
-        self.free()
-        
-        # Process c component
-        c_shards = self.int_keys(c_shards)
-        c_hessian = self.convert_to_hessian(c_shards, tensor_name='c')
-        c_jvp_gradients = self.jvp_gradients_and_hessian_slow(
-            c_hessian, max_probes=1024, step_size=8, tensor_name='c'
-        )
-        
-        print("True Hessian:")
-        print(c_hessian[0])
-        print()
-        
-        print("Estimated Hessians:")
-        for k in c_jvp_gradients.keys():
-            if k not in [8, 16, 32, 64, 128, 256, 512, 1024]:
-                continue
-            print(k)
-            print(c_jvp_gradients[k][0, :, :])
-            print()
-        
-        self.plot_hessian_estimations(c_hessian, c_jvp_gradients,
-                                      gptq_val=torch.block_diag(gptq_aggregated, gptq_aggregated),
-                                      tensor_name='c')
-        
-        del c_shards, c_hessian, c_jvp_gradients
-        self.free()
-        
-        return
+        for shard, name, gptq_val in component_specs:
+            self._process_component(shard, name, gptq_val, max_probes=64, step_size=4)
     
-    def stitch_plots(self):
+    @staticmethod
+    def _load_metric_across_layers(component, metric, layers, base_path="jacobian_jvp_error/raw_data"):
         """
-        Create aggregated plots across all layers.
+        Load a metric for a component across multiple layers.
         
-        This method loads the previously saved Jacobian data from all processed
-        layers and creates comprehensive visualization plots showing:
-        - Error trends across layers
-        - Timing information
-        - Comparisons with GPTQ baseline
+        Parameters:
+            component (str): Component name ('z', 'x', 'b', or 'c')
+            metric (str): Metric name (e.g., 'cosine', 'cosine_bd', 'cosine_bar')
+            layers (list): List of layer indices to load
+            base_path (str): Base directory for data files
         
-        Only runs for layer 0 (to avoid duplicate processing).
+        Returns:
+            np.ndarray: Averaged metric across layers and channels
         """
-        # Only run for layer 0
-        if self.idx != 0:
-            print("skipping layer\n")
+        data_list = []
+        for layer in layers:
+            try:
+                file_path = f"{base_path}/{component}/{layer}_{metric}.npy"
+                data = np.load(file_path)
+                if not np.isnan(data).any():
+                    # Average across channels (axis 0) to get probe-count dimension
+                    data_list.append(data.mean(axis=0))
+            except FileNotFoundError:
+                continue
+        
+        if data_list:
+            # Stack across layers and average
+            return np.stack(data_list, axis=0).mean(axis=0)
+        return None
+    
+    @staticmethod
+    def _load_timing_across_layers(component, layers, base_path="jacobian_jvp_error/times"):
+        """Load timing data for a component across multiple layers."""
+        timing_list = []
+        for layer in layers:
+            try:
+                file_path = f"{base_path}/{component}/{layer}.npy"
+                data = np.load(file_path)
+                if not np.isnan(data).any():
+                    timing_list.append(data)
+            except FileNotFoundError:
+                continue
+        
+        if timing_list:
+            return np.stack(timing_list, axis=0).mean(axis=0)
+        return None
+    
+    def plot_aggregated_errors(self, layers=None, step_size=4, max_probes=64):
+        """
+        Plot error curves for all components and aggregation methods.
+        
+        Creates one plot per aggregation method showing all components (z, x, b, c).
+        
+        Parameters:
+            layers (list): Layer indices to aggregate over (default: [0, 1, 4, 7, 10, 13, 16, 19, 22, 23])
+            step_size (int): Step size used during estimation
+            max_probes (int): Maximum number of probes used
+        """
+        if self.idx != 23:
             return
         
-        # Layers that were processed
-        layers = [0, 1, 4, 7, 10, 13, 16, 19, 22, 23]
+        if layers is None:
+            layers = [0, 1, 4, 7, 10, 13, 16, 19, 22, 23]
         
-        probe_counts = [8*i for i in range(1, 129)]
+        probe_counts = [step_size * i for i in range(1, max_probes // step_size + 1)]
+        components = ['z', 'x', 'b', 'c']
+        component_labels = [r'$W_z$', r'$W_x$', r'$W_b$', r'$W_c$']
+        component_colors = ['red', 'green', 'blue', 'purple']
         
-        # Lists to store data from all layers
-        z_list = []
-        x_list = []
-        b_list = []
-        c_list = []
+        # Get labels for plotting
+        matrix_labels = self._get_matrix_labels()
+        aggregation_labels = self._get_aggregation_labels()
         
-        gptq_list_z = []
-        gptq_list_x = []
-        gptq_list_b = []
-        gptq_list_c = []
+        # Create a plot for each combination of matrix representation and aggregation
+        for mat_suffix in self._get_matrix_transforms().keys():
+            for agg_suffix in self._get_aggregation_functions().keys():
+                metric = f"cosine{mat_suffix}{agg_suffix}"
+                mat_label = matrix_labels[mat_suffix]
+                agg_label = aggregation_labels[agg_suffix]
+                
+                plt.figure(figsize=(10, 6))
+                
+                # Plot each component
+                for comp, label, color in zip(components, component_labels, component_colors):
+                    errors = self._load_metric_across_layers(comp, metric, layers)
+                    if errors is not None:
+                        plt.plot(probe_counts, errors, label=label, color=color, linewidth=2)
+                
+                plt.xlabel('Probe Count (# IID Samples)', fontsize=12)
+                plt.ylabel('Cosine Similarity', fontsize=12)
+                plt.title(f'JVP Hessian Estimation Error: {mat_label}, {agg_label}\n'
+                         f'(Averaged Across {len(layers)} Layers)', fontsize=13)
+                plt.legend(loc='best', fontsize=11)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                save_path = f"jacobian_jvp_error/Aggregated_Error_{metric}.png"
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                
+                print(f"Saved error plot: {save_path}")
+    
+    def plot_runtime_comparison(self, layers=None, step_size=4, max_probes=64):
+        """
+        Plot runtime vs probe count for all components.
         
-        z_list_bd = []
-        x_list_bd = []
-        b_list_bd = []
-        c_list_bd = []
+        Creates a dual y-axis plot with z,x on one axis and b,c on another
+        (since b,c typically take longer due to grouped structure).
         
-        gptq_list_z_bd = []
-        gptq_list_x_bd = []
-        gptq_list_b_bd = []
-        gptq_list_c_bd = []
+        Parameters:
+            layers (list): Layer indices to aggregate over
+            step_size (int): Step size used during estimation
+            max_probes (int): Maximum number of probes used
+        """
+        if self.idx != 23:
+            return
         
-        # Load timing data from all layers
-        for layer in layers:
-            if not np.isnan(np.load(f"jacobian_jvp_error/times/z/{layer}.npy")).any():
-                z_list.append(np.load(f"jacobian_jvp_error/times/z/{layer}.npy"))
-            if not np.isnan(np.load(f"jacobian_jvp_error/times/x/{layer}.npy")).any():
-                x_list.append(np.load(f"jacobian_jvp_error/times/x/{layer}.npy"))
-            if not np.isnan(np.load(f"jacobian_jvp_error/times/b/{layer}.npy")).any():
-                b_list.append(np.load(f"jacobian_jvp_error/times/b/{layer}.npy"))
-            if not np.isnan(np.load(f"jacobian_jvp_error/times/c/{layer}.npy")).any():
-                c_list.append(np.load(f"jacobian_jvp_error/times/c/{layer}.npy"))
-            
-            # Load cosine similarity data (block diagonal)
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_cosine_bd.npy")).any():
-                z_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_cosine_bd.npy").mean(axis=0))
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_cosine_bd.npy")).any():
-                x_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_cosine_bd.npy").mean(axis=0))
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_cosine_bd.npy")).any():
-                b_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_cosine_bd.npy").mean(axis=0))
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_cosine_bd.npy")).any():
-                c_list_bd.append(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_cosine_bd.npy").mean(axis=0))
-            
-            # Load GPTQ comparison data
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine.npy")).any():
-                gptq_list_z.extend(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine.npy")).any():
-                gptq_list_x.extend(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine.npy")).any():
-                gptq_list_b.extend(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine.npy")).any():
-                gptq_list_c.extend(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine.npy").flatten())
-            
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine_bd.npy")).any():
-                gptq_list_z_bd.extend(np.load(f"jacobian_jvp_error/raw_data/z/{layer}_gptq_cosine_bd.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine_bd.npy")).any():
-                gptq_list_x_bd.extend(np.load(f"jacobian_jvp_error/raw_data/x/{layer}_gptq_cosine_bd.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine_bd.npy")).any():
-                gptq_list_b_bd.extend(np.load(f"jacobian_jvp_error/raw_data/b/{layer}_gptq_cosine_bd.npy").flatten())
-            if not np.isnan(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine_bd.npy")).any():
-                gptq_list_c_bd.extend(np.load(f"jacobian_jvp_error/raw_data/c/{layer}_gptq_cosine_bd.npy").flatten())
+        if layers is None:
+            layers = [0, 1, 4, 7, 10, 13, 16, 19, 22, 23]
         
-        # Stack and average across layers
-        z_list = np.stack(z_list, axis=0)
-        x_list = np.stack(x_list, axis=0)
-        b_list = np.stack(b_list, axis=0)
-        c_list = np.stack(c_list, axis=0)
-        z_list_bd = np.stack(z_list_bd, axis=0)
-        x_list_bd = np.stack(x_list_bd, axis=0)
-        b_list_bd = np.stack(b_list_bd, axis=0)
-        c_list_bd = np.stack(c_list_bd, axis=0)
+        probe_counts = [step_size * i for i in range(1, max_probes // step_size + 1)]
         
-        print(z_list)
+        # Load timing data for all components
+        timing_data = {}
+        for comp in ['z', 'x', 'b', 'c']:
+            timing_data[comp] = self._load_timing_across_layers(comp, layers)
         
-        z_list = z_list.mean(axis=0)
-        x_list = x_list.mean(axis=0)
-        b_list = b_list.mean(axis=0)
-        c_list = c_list.mean(axis=0)
-        z_list_bd = z_list_bd.mean(axis=0)
-        x_list_bd = x_list_bd.mean(axis=0)
-        b_list_bd = b_list_bd.mean(axis=0)
-        c_list_bd = c_list_bd.mean(axis=0)
-        
-        print(gptq_list_z)
-        for i in range(len(gptq_list_z)):
-            print(gptq_list_z[i])
-            print(gptq_list_z[i].shape)
-            print()
-        
-        gptq_mean_z = np.mean(gptq_list_z)
-        gptq_mean_x = np.mean(gptq_list_x)
-        gptq_mean_b = np.mean(gptq_list_b)
-        gptq_mean_c = np.mean(gptq_list_c)
-        
-        gptq_mean_z_bd = np.mean(gptq_list_z_bd)
-        gptq_mean_x_bd = np.mean(gptq_list_x_bd)
-        gptq_mean_b_bd = np.mean(gptq_list_b_bd)
-        gptq_mean_c_bd = np.mean(gptq_list_c_bd)
-        
-        print(gptq_mean_z)
-        print(gptq_mean_x)
-        print(gptq_mean_b)
-        print(gptq_mean_c)
-        
-        # Create comprehensive runtime plot with dual y-axes
+        # Create dual y-axis plot
         fig, ax1 = plt.subplots(figsize=(10, 6))
         
-        ax1.plot(probe_counts, z_list, label=r'$W_z$', color='red')
-        ax1.plot(probe_counts, x_list, label=r'$W_x$', color='green')
+        # Plot z and x on primary axis
+        if timing_data['z'] is not None:
+            ax1.plot(probe_counts, timing_data['z'], label=r'$W_z$', 
+                    color='red', linewidth=2)
+        if timing_data['x'] is not None:
+            ax1.plot(probe_counts, timing_data['x'], label=r'$W_x$', 
+                    color='green', linewidth=2)
         
-        ax1.set_xlabel('Probe Count (# IID Samples)')
-        ax1.set_ylabel(r'Runtime for $W_z$, $W_x$ (s)')
-        ax1.set_title(r'Runtime vs. Probe Count (Averaged Across 10 Layers)', pad=10)
+        ax1.set_xlabel('Probe Count (# IID Samples)', fontsize=12)
+        ax1.set_ylabel(r'Runtime for $W_z$, $W_x$ (s)', fontsize=12, color='black')
+        ax1.tick_params(axis='y', labelcolor='black')
         
-        values = [gptq_mean_z, gptq_mean_x, gptq_mean_b, gptq_mean_c]
-        labels = [r"GPTQ $W_z$", r"GPTQ $W_x$", r"GPTQ $W_b$", r"GPTQ $W_c$"]
-        colors = ['red', 'green', 'blue', 'purple']
-        
-        # Create second y-axis for b and c components
+        # Create secondary y-axis for b and c
         ax2 = ax1.twinx()
-        ax2.plot(probe_counts, b_list, label=r'$W_b$', color='blue')
-        ax2.plot(probe_counts, c_list, label=r'$W_c$', color='purple')
-        ax2.set_ylabel(r'Runtime for $W_b$, $W_c$ (s)')
+        if timing_data['b'] is not None:
+            ax2.plot(probe_counts, timing_data['b'], label=r'$W_b$', 
+                    color='blue', linewidth=2)
+        if timing_data['c'] is not None:
+            ax2.plot(probe_counts, timing_data['c'], label=r'$W_c$', 
+                    color='purple', linewidth=2)
         
-        # Combine legends from both axes
+        ax2.set_ylabel(r'Runtime for $W_b$, $W_c$ (s)', fontsize=12, color='black')
+        ax2.tick_params(axis='y', labelcolor='black')
+        
+        # Combine legends
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower center', 
-                  bbox_to_anchor=(0.5, 1.10), ncol=8, frameon=True, fontsize='small')
+        ax1.legend(lines1 + lines2, labels1 + labels2, 
+                  loc='upper left', fontsize=11, frameon=True)
         
-        plt.subplots_adjust(top=0.82)
-        plt.show()
+        plt.title(f'Runtime vs. Probe Count (Averaged Across {len(layers)} Layers)', 
+                 fontsize=13, pad=15)
+        ax1.grid(True, alpha=0.3)
+        plt.tight_layout()
         
-        plt.savefig(f"jacobian_jvp_error/Gaussian_130m_Stitched_Averaged_Runtime2.png", 
-                   bbox_inches='tight')
+        save_path = "jacobian_jvp_error/Aggregated_Runtime.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
         
-        plt.clf()
+        print(f"Saved runtime plot: {save_path}")
+    
+    def create_all_plots(self, layers=None, step_size=4, max_probes=64):
+        """
+        Create all aggregated plots: error curves and runtime comparison.
         
-        print("Stitched plots complete!")
+        This is the main entry point for generating plots after running
+        JVP estimation across multiple layers.
+        
+        Parameters:
+            layers (list): Layer indices to aggregate over
+            step_size (int): Step size used during estimation
+            max_probes (int): Maximum number of probes used
+        """
+        if self.idx != 23:
+            print("Skipping plot generation (only runs on layer 23)")
+            return
+        
+        print("Generating aggregated error plots...")
+        self.plot_aggregated_errors(layers, step_size, max_probes)
+        
+        print("Generating runtime comparison plot...")
+        self.plot_runtime_comparison(layers, step_size, max_probes)
+        
+        print("All plots generated successfully!")
     
     def free(self):
         """Free GPU memory."""
