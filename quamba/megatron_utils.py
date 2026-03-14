@@ -10,7 +10,10 @@ import os
 import torch
 import sentencepiece
 from sentencepiece import sentencepiece_model_pb2 as spm_pb2
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+try:
+    from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+except ImportError:
+    from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer as MegatronTokenizer
 
 
 class _SentencePieceTokenizer(MegatronTokenizer):

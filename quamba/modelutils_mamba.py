@@ -31,7 +31,7 @@ from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
 from .observer import PerSSDGroupObserver, CrossHeadMinmaxObserver
 from .observer import CachedStatesCrossHeadMinmaxObserver
 from .gptq_utils import GPTQ
-from .smgptq import SMGPTQ
+# from .smgptq import SMGPTQ  # removed: old Hutchinson sketching, superseded by lr_kfac.py
 from .reorder_utils import get_reorder_params, reorder_mamba
 from .hadamard_utils import had_transform
 from .data_loaders import get_loaders
@@ -793,33 +793,8 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         logging.debug(f"Layer {i}")
         layer = layers[i].to(device)
 
-        if model_type in ["mamba", "mamba2"]:
-            gptq_sm = {
-                "in_proj": SMGPTQ(layer.mixer, idx=i),
-            }
-
-            handles_sm = [
-                layer.mixer.register_forward_hook(partial(add_batch_layer, gptq=gptq_sm["in_proj"], is_out_layer=False)),
-                layer.mixer.norm.register_forward_hook(partial(add_batch_layer, gptq=gptq_sm["in_proj"], is_out_layer=True)),
-            ]
-            
-
-            layer(
-                inps, 
-                residual=residual
-            )
-            for h in handles_sm:
-                h.remove()
-        else:
+        if model_type not in ["mamba", "mamba2"]:
             raise ValueError(f"Unsupported model type: {model_type}")
-        
-        # start running GPTQ
-        
-        for name in gptq_sm.keys():
-            logging.debug(f"Calculating Jacobian for layer.{i}.mixer.{name} with {bits} bits")
-            gptq_sm[name].read_and_compare()
-            gptq_sm[name].free()
-        del gptq_sm
         
         # collect the outputs for the next layer
         inps, residual = layer(inps, residual=residual)
@@ -1286,7 +1261,8 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     # Apply GPTQ to quantize linear
     print(args.apply_gptq)
     if args.apply_gptq:
-        save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        # save_jacobian_samples is research code for Hessian comparison, skip for actual quantization
+        # save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
         model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
         print(model)
     # Replace (reordered, fused, and GPTQ quantized) modules with quantized version
