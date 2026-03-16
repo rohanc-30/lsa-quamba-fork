@@ -341,6 +341,411 @@ def compute_input_factor(inputs):
 
 
 # ---------------------------------------------------------------------------
+# Banded SSD cross-time correlation (for x-row front factor)
+# ---------------------------------------------------------------------------
+
+def compute_gssd_band(P, B, gamma, g_of_h, d_conv):
+    """Banded SSD Gauss-Newton correlation for x-row perturbations.
+
+    G_SSD[s1, s2, h] = phi(s1,s2) * B[s1,g]^T @ P[max(s1,s2), h] @ B[s2,g]
+
+    Only the d_conv-width band is needed (conv1d has width d_conv).
+
+    Args:
+        P: (T, H, N, N) reverse Gramian
+        B: (T, G, N) input-to-state
+        gamma: (T, H) transition coefficients
+        g_of_h: (H,) int — group index for each head
+        d_conv: int — conv1d kernel width
+
+    Returns:
+        band: (T, H, d_conv, d_conv) float32
+    """
+    T, H, N, _ = P.shape
+    device = P.device
+
+    B_exp = B[:, g_of_h]  # (T, H, N)
+    PB = torch.einsum('thnm,thm->thn', P, B_exp)  # (T, H, N)
+
+    phi_offsets = torch.ones(T, H, d_conv, device=device, dtype=torch.float32)
+    for k in range(1, d_conv):
+        valid = T - k
+        if valid <= 0:
+            break
+        phi_offsets[:valid, :, k] = phi_offsets[:valid, :, k - 1] * gamma[k:k + valid]
+
+    band = torch.zeros(T, H, d_conv, d_conv, device=device, dtype=torch.float32)
+
+    for k1 in range(d_conv):
+        for k2 in range(k1, d_conv):
+            valid = T - k2
+            if valid <= 0:
+                continue
+            offset = k2 - k1
+            bp = torch.einsum('thn,thn->th',
+                              B_exp[k1:k1 + valid],
+                              PB[k2:k2 + valid])
+            phi = phi_offsets[k1:k1 + valid, :, offset]
+            band[:valid, :, k1, k2] = phi * bp
+            if k1 != k2:
+                band[:valid, :, k2, k1] = phi * bp
+
+    return band
+
+
+def compute_front_factor_x(cache, gssd_band, D_param=None):
+    """Per-head front factor for x-rows at the in_proj level.
+
+    Chains the SSD-level sensitivity (from gssd_band / reverse Gramian)
+    with the conv+SiLU+dt Jacobian to get the actual per-head factor
+    at the in_proj output level.
+
+    F_front_x[h, p1, p2] = (1/T) sum_t beta^T F_full beta
+
+    where beta[t,j,p] = conv_w[p,j] * silu'(v_{t+j}[p]) is the linearized
+    conv+SiLU gain, and F_full encodes SSD cross-time correlation + dt + D-skip.
+
+    Args:
+        cache: dict from extract_ssd_cache
+        gssd_band: (T, H, d_conv, d_conv) from compute_gssd_band
+        D_param: (H,) or None — D skip connection parameter
+
+    Returns:
+        F_front_x: (H, P, P) float32 — per-head front factor for x-rows
+    """
+    T = cache['u'].shape[0]
+    d_ssm = cache['d_ssm']
+    nheads = cache['nheads']
+    ngroups = cache['ngroups']
+    d_state = cache['d_state']
+    headdim = cache['headdim']
+    d_conv = cache['d_conv']
+    g_of_h = cache['g_of_h']
+    device = cache['u'].device
+
+    dt = cache['dt']
+    xBC_pre_silu = cache['xBC_pre_silu']
+    conv_w = cache['conv_w']
+    gamma = cache['gamma']
+    B = cache['B']
+    C = cache['C']
+
+    # SiLU derivative for x-channels (first d_ssm of conv_dim)
+    v_x = xBC_pre_silu[:, :d_ssm].float()
+    sig_x = torch.sigmoid(v_x)
+    silu_d_x = sig_x * (1.0 + v_x * (1.0 - sig_x))
+
+    # Conv weights for x-channels: (d_ssm, d_conv)
+    cw_x = conv_w[:d_ssm, 0, :].float()
+
+    B_exp = B[:, g_of_h]
+    C_exp = C[:, g_of_h]
+
+    phi_offsets = torch.ones(T, nheads, d_conv, device=device, dtype=torch.float32)
+    for k in range(1, d_conv):
+        valid = T - k
+        if valid <= 0:
+            break
+        phi_offsets[:valid, :, k] = phi_offsets[:valid, :, k - 1] * gamma[k:k + valid]
+
+    F_front = torch.zeros(nheads, headdim, headdim, device=device, dtype=torch.float32)
+
+    for h in range(nheads):
+        p_start = h * headdim
+        p_end = p_start + headdim
+
+        cw_h = cw_x[p_start:p_end]
+        sd_h = silu_d_x[:, p_start:p_end]
+        dt_h = dt[:, h]
+        D_h = D_param[h].item() if D_param is not None else 0.0
+
+        # beta[t, j, p] = conv_w[p,j] * silu'(v_{t+j}[p])
+        beta = torch.zeros(T, d_conv, headdim, device=device, dtype=torch.float32)
+        for j in range(d_conv):
+            valid = T - j
+            if valid <= 0:
+                break
+            beta[:valid, j, :] = cw_h[:, j].unsqueeze(0) * sd_h[j:j + valid]
+
+        # Build F_full[t, j1, j2] from gssd_band + dt + D-skip
+        gssd_h = gssd_band[:, h]
+        F_full = torch.zeros(T, d_conv, d_conv, device=device, dtype=torch.float32)
+
+        for j1 in range(d_conv):
+            for j2 in range(j1, d_conv):
+                valid = T - j2
+                if valid <= 0:
+                    continue
+                dt1 = dt_h[j1:j1 + valid]
+                dt2 = dt_h[j2:j2 + valid]
+
+                entry = dt1 * dt2 * gssd_h[:valid, j1, j2]
+
+                if D_h != 0:
+                    if j1 == j2:
+                        gs = torch.einsum('tn,tn->t',
+                                          C_exp[j1:j1 + valid, h],
+                                          B_exp[j1:j1 + valid, h])
+                        entry = entry + 2 * D_h * dt1 * gs + D_h ** 2
+                    else:
+                        phi_val = phi_offsets[j1:j1 + valid, h, j2 - j1]
+                        gs = (torch.einsum('tn,tn->t',
+                                           C_exp[j2:j2 + valid, h],
+                                           B_exp[j1:j1 + valid, h])
+                              * phi_val)
+                        entry = entry + D_h * dt1 * gs
+
+                F_full[:valid, j1, j2] = entry
+                if j1 != j2:
+                    F_full[:valid, j2, j1] = entry
+
+        # F_front_h = (1/T) sum_t beta^T F_full beta
+        F_beta = torch.einsum('tjl,tlp->tjp', F_full, beta)
+        F_front[h] = torch.einsum('tjp,tjq->pq', beta, F_beta) / T
+
+    return F_front
+
+
+# ---------------------------------------------------------------------------
+# Front factors for B-rows and C-rows at the in_proj level
+# ---------------------------------------------------------------------------
+
+def compute_front_factor_B(cache, P, D_param=None):
+    """Per-head front factor for B-rows at the in_proj level.
+
+    Chains the SSD-level B-sensitivity with the conv+SiLU Jacobian.
+
+    SSD sensitivity for B perturbations:
+        G_B_SSD[s1, s2, h, n1, n2] = phi(s1,s2) * P[s2][n1,n2] * (x_dt_s1 . x_dt_s2)_h
+
+    Chained with conv+SiLU:
+        F_B[h, n1, n2] = (1/T) sum_t sum_{j1,j2} beta_B[t,j1,n1] * beta_B[t,j2,n2]
+                          * phi(t+j1, t+j2) * P[t+j2][n1,n2] * (x_dt_{t+j1} . x_dt_{t+j2})_h
+
+    Args:
+        cache: dict from extract_ssd_cache
+        P: (T, H, N, N) reverse Gramian
+        D_param: unused, for API consistency
+
+    Returns:
+        F_front_B: (H, N, N) float32 — per-head front factor for B-rows
+    """
+    T = cache['u'].shape[0]
+    d_ssm = cache['d_ssm']
+    nheads = cache['nheads']
+    ngroups = cache['ngroups']
+    d_state = cache['d_state']
+    d_conv = cache['d_conv']
+    device = cache['u'].device
+
+    x_dt = cache['x_dt']             # (T, H, P)
+    gamma = cache['gamma']           # (T, H)
+    xBC_pre_silu = cache['xBC_pre_silu']
+    conv_w = cache['conv_w']
+
+    # SiLU derivative for B-channels
+    b_start = d_ssm
+    b_end = d_ssm + ngroups * d_state
+    v_B = xBC_pre_silu[:, b_start:b_end].float()  # (T, G*N)
+    sig_B = torch.sigmoid(v_B)
+    silu_d_B = sig_B * (1.0 + v_B * (1.0 - sig_B))  # (T, G*N)
+
+    # Conv weights for B-channels: (G*N, d_conv)
+    cw_B = conv_w[b_start:b_end, 0, :].float()  # (G*N, d_conv)
+
+    # beta_B[t, j, n] = conv_w[n, j] * silu'(v_{t+j}[n])
+    beta_B = torch.zeros(T, d_conv, ngroups * d_state, device=device, dtype=torch.float32)
+    for j in range(d_conv):
+        valid = T - j
+        if valid <= 0:
+            break
+        beta_B[:valid, j, :] = cw_B[:, j].unsqueeze(0) * silu_d_B[j:j + valid]
+
+    # phi offsets
+    phi_offsets = torch.ones(T, nheads, d_conv, device=device, dtype=torch.float32)
+    for k in range(1, d_conv):
+        valid = T - k
+        if valid <= 0:
+            break
+        phi_offsets[:valid, :, k] = phi_offsets[:valid, :, k - 1] * gamma[k:k + valid]
+
+    # Accumulate F_front_B: (H, N, N)
+    # For ngroups=1, all N channels are in group 0
+    F_B = torch.zeros(nheads, d_state, d_state, device=device, dtype=torch.float64)
+
+    for j1 in range(d_conv):
+        for j2 in range(j1, d_conv):
+            valid = T - j2
+            if valid <= 0:
+                continue
+            offset = j2 - j1
+
+            # phi(t+j1, t+j2): (valid, H)
+            phi = phi_offsets[j1:j1 + valid, :, offset]
+
+            # x_dt inner product: (valid, H)
+            xdot = torch.einsum('thp,thp->th', x_dt[j1:j1 + valid], x_dt[j2:j2 + valid])
+
+            # coeff = phi * xdot: (valid, H)
+            coeff = phi * xdot
+
+            # P at max timestep: P[j2:j2+valid] = (valid, H, N, N)
+            P_block = P[j2:j2 + valid]
+
+            # beta products: (valid, G*N) for j1 and j2
+            b1 = beta_B[:valid, j1, :]  # (valid, G*N)
+            b2 = beta_B[:valid, j2, :]  # (valid, G*N)
+
+            # For each group g, accumulate:
+            # F_B[h, n1, n2] += sum_t coeff[t,h] * b1[t,n1] * b2[t,n2] * P[t,h,n1,n2]
+            # Since ngroups typically = 1, all n1,n2 are in group 0
+            # and all heads see the same B-channels
+            g_of_h = cache['g_of_h']
+            for g in range(ngroups):
+                n_start = g * d_state
+                n_end = n_start + d_state
+                heads_in_g = (g_of_h == g).nonzero(as_tuple=True)[0]
+
+                b1_g = b1[:, n_start:n_end]  # (valid, N)
+                b2_g = b2[:, n_start:n_end]  # (valid, N)
+
+                for h_idx in heads_in_g:
+                    h = h_idx.item()
+                    # weighted_P[t,n,m] = coeff[t,h] * P[t,h,n,m]
+                    weighted_P = coeff[:valid, h].unsqueeze(-1).unsqueeze(-1) * P_block[:valid, h]
+                    # contrib[n,m] = sum_t b1[t,n] * weighted_P[t,n,m] * b2[t,m]
+                    contrib = torch.einsum('tn,tnm,tm->nm',
+                                           b1_g.double(), weighted_P.double(), b2_g.double())
+                    F_B[h] += contrib
+                    if j1 != j2:
+                        F_B[h] += contrib.T  # symmetric in j1, j2
+
+    F_B = (F_B / T).float()
+    return F_B
+
+
+def compute_front_factor_C(cache, forward_StS):
+    """Per-head front factor for C-rows at the in_proj level.
+
+    C-row SSD sensitivity is diagonal in time (perturbing C_s only affects y_s):
+        G_C_SSD[s, h, n1, n2] = [S_s^T S_s]_{h, n1, n2}
+
+    Chained with conv+SiLU (only same-time j1=j2 terms survive):
+        F_C[h, n1, n2] = (1/T) sum_s sum_j beta_C[s-j, j, n1] * beta_C[s-j, j, n2]
+                          * [S_s^T S_s]_{h, n1, n2}
+
+    Args:
+        cache: dict from extract_ssd_cache
+        forward_StS: (T, H, N, N) per-timestep S_t^T S_t from forward scan
+
+    Returns:
+        F_front_C: (H, N, N) float32 — per-head front factor for C-rows
+    """
+    T = cache['u'].shape[0]
+    d_ssm = cache['d_ssm']
+    nheads = cache['nheads']
+    ngroups = cache['ngroups']
+    d_state = cache['d_state']
+    d_conv = cache['d_conv']
+    device = cache['u'].device
+
+    xBC_pre_silu = cache['xBC_pre_silu']
+    conv_w = cache['conv_w']
+
+    # SiLU derivative for C-channels
+    c_start = d_ssm + ngroups * d_state
+    c_end = c_start + ngroups * d_state
+    v_C = xBC_pre_silu[:, c_start:c_end].float()  # (T, G*N)
+    sig_C = torch.sigmoid(v_C)
+    silu_d_C = sig_C * (1.0 + v_C * (1.0 - sig_C))  # (T, G*N)
+
+    # Conv weights for C-channels: (G*N, d_conv)
+    cw_C = conv_w[c_start:c_end, 0, :].float()
+
+    # For C, only j1=j2 terms survive (SSD is diagonal in time).
+    # F_C[h, n1, n2] = (1/T) sum_s sum_j [cw[n1,j]*silu'_s[n1]] * [cw[n2,j]*silu'_s[n2]] * StS[s,h,n1,n2]
+    # = (1/T) sum_s [sum_j cw[n1,j]*cw[n2,j]] * silu'_s[n1]*silu'_s[n2] * StS[s,h,n1,n2]
+    # But careful: beta[t,j,n] uses silu' at t+j, and we need s=t+j, so for different j
+    # the silu' is at the same s but the "source" t differs. The beta formula is:
+    # beta[t,j,n] = cw[n,j] * silu'_{t+j}[n], and we sum over j at fixed s=t+j.
+
+    # Accumulate: for each output timestep s, sum over j such that t=s-j >= 0
+    F_C = torch.zeros(nheads, d_state, d_state, device=device, dtype=torch.float64)
+
+    for j in range(d_conv):
+        # Source timestep t = s - j, so s ranges from j to T-1
+        valid = T - j
+        if valid <= 0:
+            break
+        # beta at (t=s-j, j, n) = cw[n, j] * silu'_s[n]  (since t+j = s)
+        # For all valid s: silu' is at s = j..T-1
+        silu_s = silu_d_C[j:j + valid]  # (valid, G*N)
+        cw_j = cw_C[:, j]  # (G*N,)
+        beta_j = cw_j.unsqueeze(0) * silu_s  # (valid, G*N)
+
+        # StS at timestep s = j..T-1
+        StS_s = forward_StS[j:j + valid]  # (valid, H, N, N)
+
+        # For each group
+        g_of_h = cache['g_of_h']
+        for g in range(ngroups):
+            n_start = g * d_state
+            n_end = n_start + d_state
+            b_g = beta_j[:, n_start:n_end]  # (valid, N)
+
+            heads_in_g = (g_of_h == g).nonzero(as_tuple=True)[0]
+            for h_idx in heads_in_g:
+                h = h_idx.item()
+                # F_C[h, n1, n2] += sum_s b_g[s,n1] * b_g[s,n2] * StS[s,h,n1,n2]
+                StS_h = StS_s[:, h]  # (valid, N, N)
+                F_C[h] += torch.einsum('tn,tnm,tm->nm',
+                                       b_g.double(), StS_h.double(), b_g.double())
+
+    F_C = (F_C / T).float()
+    return F_C
+
+
+# ---------------------------------------------------------------------------
+# Modified forward state scan: also returns per-timestep S^T S for C-rows
+# ---------------------------------------------------------------------------
+
+def forward_state_scan_with_StS(x_dt, B, gamma, ngroups, nheads):
+    """Forward state recurrence returning G_Q and per-timestep S_t^T S_t.
+
+    Same as forward_state_scan but also stores S_t^T S_t at each timestep
+    (needed by compute_front_factor_C).
+
+    Returns:
+        G_Q: (H, N, N) float32
+        StS: (T, H, N, N) float32 — per-timestep S_t^T S_t
+        S_last: (H, P, N) float32
+    """
+    T, H, P = x_dt.shape
+    _, G, N = B.shape
+    device = x_dt.device
+
+    g_of_h = torch.arange(H, device=device) // (H // ngroups)
+
+    S = torch.zeros(H, P, N, device=device, dtype=torch.float32)
+    G_Q_accum = torch.zeros(H, N, N, device=device, dtype=torch.float64)
+    StS = torch.zeros(T, H, N, N, device=device, dtype=torch.float32)
+
+    for t in range(T):
+        gamma_t = gamma[t].unsqueeze(-1).unsqueeze(-1)
+        v_t = x_dt[t]
+        k_t = B[t, g_of_h]
+
+        S = gamma_t * S + torch.einsum('hp,hn->hpn', v_t, k_t)
+
+        StS_t = torch.einsum('hpn,hpm->hnm', S, S)
+        StS[t] = StS_t
+        G_Q_accum += StS_t.double()
+
+    G_Q = (G_Q_accum / T).float()
+    return G_Q, StS, S.clone()
+
+
+# ---------------------------------------------------------------------------
 # Tail factor: time-averaged Omega_bar (= plan's shared post metric)
 # ---------------------------------------------------------------------------
 
@@ -554,6 +959,151 @@ def forward_state_scan(x_dt, B, gamma, ngroups, nheads):
 
 
 # ---------------------------------------------------------------------------
+# Gramian-weighted column Hessians (per-block weighted input covariance)
+# ---------------------------------------------------------------------------
+
+def compute_weighted_hessians(mixer, inputs, nsamples=None):
+    """Compute per-block weighted column Hessians using reverse Gramian sensitivity.
+
+    Standard GPTQ uses A = (1/NT) sum_t a_t a_t^T (uniform token weighting).
+    This function computes per-block weighted versions:
+
+        A_x = (1/Z) sum_t w_x(t) * a_t a_t^T
+        A_B = (1/Z) sum_t w_B(t) * a_t a_t^T
+        A_C = (1/Z) sum_t w_C(t) * a_t a_t^T
+
+    where the per-token weights come from the reverse Gramian:
+        w_x(t) = sum_h k_t^T M_t k_t          (B-Gramian quadratic form)
+        w_B(t) = sum_h ||x_dt_t||^2 * tr(M_t)  (value norm * Gramian trace)
+        w_C(t) = sum_h ||S_t||_F^2             (state energy)
+
+    Tokens where the recurrence is more sensitive get higher weight,
+    so the GPTQ column solver focuses on minimizing error at those tokens.
+
+    Args:
+        mixer: Mamba2 mixer module
+        inputs: (N_samples, T, d_model) calibration data
+        nsamples: int or None
+
+    Returns dict with:
+        A_uniform: (d_model, d_model) — standard GPTQ Hessian (for z/dt rows)
+        A_x: (d_model, d_model) — weighted Hessian for x-rows
+        A_B: (d_model, d_model) — weighted Hessian for B-rows
+        A_C: (d_model, d_model) — weighted Hessian for C-rows
+        nheads, ngroups, headdim, d_state, d_ssm — layout metadata
+    """
+    N_total = inputs.shape[0]
+    N = nsamples if nsamples is not None else N_total
+    N = min(N, N_total)
+
+    nheads = mixer.nheads
+    ngroups = mixer.ngroups
+    d_state = mixer.d_state
+    headdim = mixer.headdim
+    d_model = inputs.shape[2]
+    device = inputs.device
+
+    A_uniform_accum = torch.zeros(d_model, d_model, device=device, dtype=torch.float64)
+    A_x_accum = torch.zeros(d_model, d_model, device=device, dtype=torch.float64)
+    A_B_accum = torch.zeros(d_model, d_model, device=device, dtype=torch.float64)
+    A_C_accum = torch.zeros(d_model, d_model, device=device, dtype=torch.float64)
+
+    w_x_total = 0.0
+    w_B_total = 0.0
+    w_C_total = 0.0
+    n_tokens_total = 0
+
+    logger.info("Computing Gramian-weighted column Hessians over %d samples", N)
+
+    g_of_h = torch.arange(nheads, device=device) // (nheads // ngroups)
+
+    for s in range(N):
+        u = inputs[s].detach()  # (T, d_model)
+        cache = extract_ssd_cache(u, mixer)
+
+        T_seq = cache['gamma'].shape[0]
+        gamma = cache['gamma']     # (T, H)
+        B_s = cache['B']           # (T, G, N)
+        C_s = cache['C']           # (T, G, N)
+        x_dt = cache['x_dt']      # (T, H, P)
+
+        # Reverse Gramian: M_t (T, H, N, N)
+        M = reverse_gramian_scan(C_s, gamma, ngroups, nheads)
+
+        # Forward state scan for ||S_t||_F^2
+        S = torch.zeros(nheads, headdim, d_state, device=device, dtype=torch.float32)
+        w_C_per_t = torch.zeros(T_seq, device=device)
+
+        # Per-token weights
+        w_x_per_t = torch.zeros(T_seq, device=device)
+        w_B_per_t = torch.zeros(T_seq, device=device)
+
+        # w_B(t) = sum_h ||x_dt_t,h||^2 * trace(M_t,h)
+        xdt_sq = x_dt.pow(2).sum(dim=-1)  # (T, H)
+        M_trace = M.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # (T, H)
+        w_B_per_t = (xdt_sq * M_trace).sum(dim=-1)  # (T,)
+
+        # w_x(t) = sum_h k_t^T M_t k_t
+        k_t = B_s[:, g_of_h]  # (T, H, N)
+        Mk = torch.einsum('thnm,thm->thn', M, k_t)
+        kMk = torch.einsum('thn,thn->th', k_t, Mk)
+        w_x_per_t = kMk.sum(dim=-1)  # (T,)
+
+        # w_C(t) = sum_h ||S_t||_F^2 — need forward scan
+        for t in range(T_seq):
+            gamma_t = gamma[t].unsqueeze(-1).unsqueeze(-1)
+            v_t = x_dt[t]
+            kt = B_s[t, g_of_h]
+            S = gamma_t * S + torch.einsum('hp,hn->hpn', v_t, kt)
+            w_C_per_t[t] = S.pow(2).sum().item()
+
+        # Accumulate weighted Hessians
+        a = u.float().double()  # (T, d_model)
+        # Uniform
+        A_uniform_accum += a.T @ a
+
+        # Weighted: A_block = sum_t w(t) * a_t a_t^T
+        # Efficient: (a * sqrt(w))^T @ (a * sqrt(w)) but w can be negative in theory
+        # Safer: a^T @ diag(w) @ a = (a * w.unsqueeze(-1))^T @ a
+        A_x_accum += (a * w_x_per_t.double().unsqueeze(-1)).T @ a
+        A_B_accum += (a * w_B_per_t.double().unsqueeze(-1)).T @ a
+        A_C_accum += (a * w_C_per_t.double().unsqueeze(-1)).T @ a
+
+        w_x_total += w_x_per_t.sum().item()
+        w_B_total += w_B_per_t.sum().item()
+        w_C_total += w_C_per_t.sum().item()
+        n_tokens_total += T_seq
+
+        del cache, M, S, Mk, kMk
+
+    # Normalize
+    A_uniform = (A_uniform_accum / (N * T_seq)).float()
+    A_x = (A_x_accum / max(w_x_total, 1e-30)).float()
+    A_B = (A_B_accum / max(w_B_total, 1e-30)).float()
+    A_C = (A_C_accum / max(w_C_total, 1e-30)).float()
+
+    logger.info("Weighted Hessians computed: w_x_total=%.2e, w_B_total=%.2e, w_C_total=%.2e",
+                w_x_total, w_B_total, w_C_total)
+
+    # Log how different the weighted Hessians are from uniform
+    for name, Aw in [('A_x', A_x), ('A_B', A_B), ('A_C', A_C)]:
+        diff = torch.norm(Aw - A_uniform).item() / torch.norm(A_uniform).item()
+        logger.info("  %s vs A_uniform: rel_diff=%.4f", name, diff)
+
+    return {
+        'A_uniform': A_uniform,
+        'A_x': A_x,
+        'A_B': A_B,
+        'A_C': A_C,
+        'nheads': nheads,
+        'ngroups': ngroups,
+        'headdim': headdim,
+        'd_state': d_state,
+        'd_ssm': mixer.d_ssm,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pre+core factor computation (plan Sections 8.2-8.3)
 # ---------------------------------------------------------------------------
 
@@ -663,12 +1213,11 @@ def compute_precore_factors(mixer, inputs, nsamples=None):
         'G_Q_group': G_Q_group,
         'G_K_group': G_K_group,
         'A': A,
-        'metadata': {
-            'nheads': nheads,
-            'ngroups': ngroups,
-            'headdim': headdim,
-            'd_state': d_state,
-        },
+        'nheads': nheads,
+        'ngroups': ngroups,
+        'headdim': headdim,
+        'd_state': d_state,
+        'd_ssm': mixer.d_ssm,
     }
 
 

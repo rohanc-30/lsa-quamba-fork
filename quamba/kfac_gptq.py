@@ -91,36 +91,64 @@ def _compute_column_hinv(A, in_dim, device, percdamp=0.01):
     return H, dead
 
 
-def _compute_row_U(G, n_units, unit_dim, device, reg_eps=1e-6):
-    """Compute upper-Cholesky of G^{-1} per unit (head or group).
+def _compute_row_U(G, n_units, unit_dim, device, reg_eps=1e-6, trace_frac=0.99):
+    """Compute upper-Cholesky of G^{-1} per unit with rank truncation.
+
+    Uses truncated eigendecomposition: only inverts eigenvalues that
+    cumulatively explain trace_frac of the total trace. Directions in
+    the null/noise space get identity (no row propagation), preventing
+    the solver from amplifying noise in rank-deficient factors.
 
     Args:
         G: (n_units, unit_dim, unit_dim) PSD row-side Gramian per unit
         n_units: int, number of heads or groups
         unit_dim: int, head dimension or state dimension
         device: torch device
-        reg_eps: regularization for Cholesky stability
+        reg_eps: minimum eigenvalue floor as fraction of max eigenvalue
+        trace_frac: fraction of trace to retain (default 0.99)
 
     Returns:
-        U_row: (n_units, unit_dim, unit_dim) upper-triangular Cholesky of G^{-1}
+        U_row: (n_units, unit_dim, unit_dim) upper-triangular factor
     """
     U_row = torch.zeros(n_units, unit_dim, unit_dim,
                          device=device, dtype=torch.float32)
     for i in range(n_units):
         G_i = G[i].clone()
+        G_i = 0.5 * (G_i + G_i.T)
         trace_val = torch.trace(G_i)
-        if trace_val > 0:
-            G_i += reg_eps * (trace_val / unit_dim) * torch.eye(
-                unit_dim, device=device)
-        else:
-            # Degenerate: fall back to identity
+        if trace_val <= 0:
             logger.warning("Row factor unit %d has non-positive trace (%.2e); "
                            "using identity", i, trace_val.item())
             U_row[i] = torch.eye(unit_dim, device=device)
             continue
-        Lc = torch.linalg.cholesky(G_i)
-        G_inv = torch.cholesky_inverse(Lc)
-        U_row[i] = torch.linalg.cholesky(G_inv, upper=True)
+
+        eigvals, eigvecs = torch.linalg.eigh(G_i)
+
+        # Truncate: keep top-k eigenvalues explaining trace_frac of the trace
+        sorted_eigs, sort_idx = eigvals.sort(descending=True)
+        cumsum = sorted_eigs.cumsum(0)
+        total = sorted_eigs.sum()
+        k = (cumsum < trace_frac * total).sum().item() + 1
+        k = max(k, 1)
+        threshold = sorted_eigs[min(k, len(sorted_eigs) - 1)]
+
+        # Floor: eigenvalues below threshold get floored to
+        # reg_eps * max_eigenvalue (so they contribute ~identity, not amplified noise)
+        eig_max = eigvals.max()
+        eig_floor = max(reg_eps * eig_max, threshold)
+        eigvals_reg = eigvals.clamp(min=eig_floor)
+
+        logger.debug("Row factor unit %d: rank=%d/%d (%.1f%% trace), "
+                     "cond=%.1e -> %.1e", i, k, unit_dim,
+                     100 * cumsum[min(k-1, len(cumsum)-1)] / total,
+                     (eig_max / eigvals.clamp(min=1e-30).min()).item(),
+                     (eig_max / eig_floor).item())
+
+        # Build U_row via eigendecomposition + QR
+        L = eigvecs @ torch.diag(eigvals_reg.pow(-0.5))
+        Q_qr, R = torch.linalg.qr(L.T)
+        signs = R.diagonal().sign()
+        U_row[i] = R * signs.unsqueeze(0)
     return U_row
 
 
