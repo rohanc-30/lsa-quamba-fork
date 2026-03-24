@@ -31,7 +31,7 @@ from .qNorm import QRMSNorm
 from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
 from .observer import PerSSDGroupObserver, CrossHeadMinmaxObserver
 from .observer import CachedStatesCrossHeadMinmaxObserver
-from .gptq_utils import GPTQ, SMGPTQ
+from .gptq_utils import GPTQ, SMGPTQ, GPTQMod
 from .reorder_utils import get_reorder_params, reorder_mamba
 from .hadamard_utils import had_transform
 from .data_loaders import get_loaders
@@ -507,8 +507,8 @@ def fuse_had_matrices(model, model_type="mamba"):
     
     return model
 
-@torch.no_grad()
-def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
+
+def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=True):
     """
     Apply GPTQ based quantization to Mamba model layers.
 
@@ -575,8 +575,16 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
             pass
 
     # the hook to collect inputs for in_proj, out_proj, and lm_head
-    def add_batch(module, inp, out, gptq, name='in_proj'):
-        gptq.add_batch(inp[0].data, out.data, name=name)
+    def add_batch(module, inp, out, gptq, name='in_proj', is_out_layer=False):
+        # Add batch as per GPTQMod class
+        if name == "in_proj":
+            if is_out_layer:
+                gptq.capture_outputs(inp[0], inp[1], out)
+            else:
+                gptq.capture_inputs(inp[0].data, out.data)
+        # Add batch as per GPTQ class
+        else:
+            gptq.add_batch(inp[0].data, out.data, name=name)
 
     layers[0] = layers[0].module # remove Catcher
     layers[0] = layers[0].cpu()
@@ -585,6 +593,8 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
     elif model_type == "gla":
         model.model.embeddings = model.model.embeddings.cpu()
     torch.cuda.empty_cache()
+    output_reconstruction_errors = []
+    residual_reconstruction_errors = []
     for i in tqdm(range(len(layers))):
         print(f"Layer {i}")
         print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
@@ -598,14 +608,27 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
 
         if model_type in ["mamba", "mamba2"]:
         # create GPTQ objects for in_proj and out_proj
-            gptq = {
-                "in_proj": GPTQ(layer.mixer.in_proj),
-                "out_proj": GPTQ(layer.mixer.out_proj),
-            }
-            handles = [
-                layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"], name="in_proj")),
-                layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"], name="out_proj"))
-            ]
+            if sm_gptq:
+                gptq = {
+                    "in_proj": GPTQMod(layer),
+                    "out_proj": GPTQ(layer.mixer.out_proj),
+                }
+
+                handles = [
+                    layer.mixer.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"], is_out_layer=False, name='in_proj')),
+                    layer.mixer.norm.register_forward_hook(partial(add_batch, gptq=gptq["in_proj"], is_out_layer=True)),
+                    layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"], name="out_proj")),
+                ]
+            else:
+                gptq = {
+                    "in_proj2": GPTQ(layer.mixer.in_proj),
+                    "out_proj": GPTQ(layer.mixer.out_proj),
+                }
+
+                handles = [
+                    layer.mixer.in_proj.register_forward_hook(partial(add_batch, gptq=gptq["in_proj2"], is_out_layer=False, name='in_proj2')),
+                    layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq["out_proj"], name="out_proj")),
+                ]
             '''
             gptq_sm = {
                 "in_proj": SMGPTQ(layer.mixer.in_proj),
@@ -616,21 +639,26 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
                 layer.mixer.register_forward_hook(partial(add_batch, gptq=gptq_sm["in_proj"])),
                 # layer.mixer.out_proj.register_forward_hook(partial(add_batch, gptq=gptq_sm["out_proj"])),
             ]
-            '''
+        '''
 
             # gptq = gptq_sm
             # handles = handles_sm
 
             # print(inps.shape)
             # print(residual.shape)
-            t0_forward = time.time()
-            layer(
+            
+            # Forward pass to collect GPTQ statistics via hooks
+            # We don't need the outputs, just need hooks to fire
+            # Actually do collect outputs to measure L2 reconstruction error
+            init_outputs, init_residuals = layer(
                 inps, 
                 residual=residual
             )
-            print(f"Time taken to forward pass: {time.time() - t0_forward} seconds")
+            
             for h in handles:
                 h.remove()
+            # Clear computation graph from hook collection pass
+            torch.cuda.empty_cache()
             #for h in handles_sm:
             #    h.remove()
         elif model_type == "gla":
@@ -658,9 +686,12 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
         # start running GPTQ
         for name in gptq.keys():
             logging.debug(f"Performing GPTQ on layer.{i}.mixer.{name} with {bits} bits")
-            gptq[name].fasterquant(
-                percdamp=0.01, group_size=128, w_bits=bits
-            )
+            if name == "in_proj":
+                gptq[name].quantize_all()
+            else:
+                gptq[name].fasterquant(
+                    percdamp=0.01, group_size=128, w_bits=bits
+                )
             gptq[name].free()
         del gptq
         
@@ -679,12 +710,25 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
             # raise ValueError
         '''
         inps, residual = layer(inps, residual=residual)
+        # Detach to prevent computation graph from accumulating across layers
+        inps = inps.detach()
+        residual = residual.detach()
+
+        output_reconstruction_errors.append((torch.norm(inps - init_outputs)).item())
+        residual_reconstruction_errors.append((torch.norm(residual - init_residuals)).item())
+
+        del init_outputs, init_residuals
         
         # garbage collection and clean cache
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
         gc.collect()
+    
+    for i in range(len(output_reconstruction_errors)):
+        print(f"Layer {i} Output Reconstruction Error: {output_reconstruction_errors[i]}")
+        print(f"Layer {i} Residual Reconstruction Error: {residual_reconstruction_errors[i]}")
+        print()
 
     model = model.to("cpu") # move model to cpu to save memory
     model.lm_head = model.lm_head.to(device)
@@ -694,7 +738,7 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba"):
         model.model.norm = model.model.norm.to(device)
     logging.info("Quantizing lm_head with GPTQ")
     gptq_lm_head = GPTQ(model.lm_head)
-    handle = model.lm_head.register_forward_hook(partial(add_batch, gptq=gptq_lm_head))
+    handle = model.lm_head.register_forward_hook(partial(add_batch, gptq=gptq_lm_head, name="lm_head"))
     
     # FIXME(HY): assert model.backbone.fused_add_norm, "Only support fused_add_norm=True for now"
     #Reference: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L202
@@ -856,7 +900,7 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
         
         for name in gptq_sm.keys():
             logging.debug(f"Calculating Jacobian for layer.{i}.mixer.{name} with {bits} bits")
-            gptq_sm[name].stitch_plots()
+            gptq_sm[name].read_and_compare()
             gptq_sm[name].free()
         del gptq_sm
         
@@ -1340,8 +1384,8 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     # Apply GPTQ to quantize linear
     print(args.apply_gptq)
     if args.apply_gptq:
-        save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
-        # model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        # save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
         print(model)
     # Replace (reordered, fused, and GPTQ quantized) modules with quantized version
     

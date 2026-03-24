@@ -232,6 +232,341 @@ class GPTQ:
         gc.collect()
 
 
+class GPTQMod:
+    def __init__(self, layer, idx=0):
+        self.idx = idx
+
+        # print(self.idx)
+
+        # print(layer)
+        self.layer = layer
+        print(layer)
+        self.dev = self.layer.mixer.in_proj.weight.device
+        # HY: To save memory, we use float16 to compute distances for non-uniform quantization
+        #     see datatype_utils.py for def fake_quantize_with_type 
+        self.gptq_dtype = torch.float16
+        
+        # print(self.layer.in_proj.weight.shape)
+        # print(self.layer.out_proj.weight.shape)
+
+        self.out_dim = self.layer.mixer.out_proj.weight.shape[1] # channels after mixer, before out_proj
+        self.in_dim = self.layer.mixer.in_proj.weight.shape[1] # channels after in_proj
+        # print(self.out_dim)
+        # print(self.in_dim)
+
+        # print("headdim: ", self.layer.headdim)
+        # print("ngroups: ", self.layer.ngroups)
+        # print("d_state: ", self.layer.d_state)
+        # print("d_inner: ", self.layer.d_inner)
+        # print("nheads: ", self.layer.nheads)
+        # print("expansion factor: ", self.layer.expand)
+        # print("d_ssm: ", self.layer.d_ssm)
+        # print("d_model: ", self.layer.d_model)
+        # print()
+
+        self.name = "in_proj"
+
+    # How do we take derivative of out with respect to the WEIGHT of the layer (self.layer.weight)?
+    # Store this derivative in J
+    # That is, J = d(out)/d(self.layer.weight)
+    def capture_inputs(self, inp, out):
+        # print(inp.shape)
+        # print(out.shape)
+        # print(self.layer)
+        # print()
+        self.inputs = inp
+        print(self.inputs.shape)
+
+    def capture_outputs(self, x, z, out):
+        print(x.shape)
+        print(z.shape)
+        print(out.shape)
+        print(self.layer)
+        # print(self.layer.__dict__)
+        # print()
+        # sum over batch dimension
+        inp = x * torch.nn.functional.silu(z)
+        self.pre_outputs = inp
+
+        # Cut to half the size
+        # self.pre_outputs = self.pre_outputs[:, :self.pre_outputs.shape[1]//2]
+        print(self.pre_outputs.shape)
+        print(self.pre_outputs)
+    
+    def generate_gradients(self, max_probes=64, channel_range=None):
+        print("Computing JVPs...")
+
+        Gs = []
+        for i in range(max_probes):
+            rand_probes = torch.randn(*self.pre_outputs.shape, device=self.pre_outputs.device)
+            prod = (self.pre_outputs.float()) * (rand_probes.float())
+            # Check prod for nan/inf
+            if torch.isnan(prod).any() or torch.isinf(prod).any():
+                print("NaN in prod")
+                # Analyze NaN/Inf in prod
+                nan_count = torch.isnan(prod).sum().item()
+                inf_count = torch.isinf(prod).sum().item()
+                print(f"NaN in prod: {nan_count}, Inf in prod: {inf_count}")
+                raise ValueError("NaN in prod")
+            scalar = prod.mean(dim=0).sum()
+            del rand_probes
+            del prod
+            print(i, scalar)
+            gi, = torch.autograd.grad(
+                outputs=scalar, inputs=self.layer.mixer.in_proj.weight,
+                retain_graph=True,
+                create_graph=False,
+            )
+            # gi /= gi.shape[0]
+            if channel_range is not None:
+                gi = gi[channel_range, :]
+            Gs.append(gi)
+            print(i, gi)
+            del scalar
+            del gi
+            gc.collect()
+
+        G = torch.stack(Gs, dim=0)
+        del Gs
+        gc.collect()
+        print(G.shape)
+        print(G)
+
+        G = G.double()
+        # G = G/G.norm()
+
+        # check for nan/inf in G
+        if torch.isnan(G).any() or torch.isinf(G).any():
+            print("NaN in G")
+            # raise ValueError("NaN in G")
+
+            # Analyze NaN/Inf in G
+            # Total Nans and Infs
+            nan_count = torch.isnan(G).sum().item()
+            inf_count = torch.isinf(G).sum().item()
+            print(f"NaN in G: {nan_count}, Inf in G: {inf_count}")
+
+            # Locations of NaNs and Infs
+            nan_indices = torch.nonzero(torch.isnan(G))
+            inf_indices = torch.nonzero(torch.isinf(G))
+            print(f"NaN indices: {nan_indices}")
+            print(f"Inf indices: {inf_indices}")
+
+            raise ValueError("NaN in G")
+
+
+            print("NaN in G, continuing...")
+
+        torch.cuda.empty_cache()
+        return G
+    
+    def generate_hessians(self, max_probes=64, channel_range=None, G=None):
+        if G is None:
+            G = self.generate_gradients(max_probes, channel_range)
+        else:
+            print("Using provided G")
+        print(G.shape)
+        print(G)
+
+        print("Generating Hessian...")
+
+
+        H = (G.permute(1, 2, 0)/max_probes @ G.permute(1, 0, 2))
+        print(H.shape)
+        print(H[0])
+        if torch.isnan(H).any() or torch.isinf(H).any():
+            print("NaN in H")
+
+            # Analyze NaN/Inf in H
+            nan_count = torch.isnan(H).sum().item()
+            inf_count = torch.isinf(H).sum().item()
+            print(f"NaN in H: {nan_count}, Inf in H: {inf_count}")
+
+            print("NaN in H, continuing...")
+        return H
+
+    def aggregate_hessians(self):
+        pass
+
+    def downdate_hessian(self, H):
+        pass
+
+    def build_cholesky(self, W, H, percdamp=.01, dtype=torch.float32):
+        # preprocess H
+        dead = torch.diagonal(H, dim1=-2, dim2=-1) == 0
+        print(dead.shape)
+        for i in range(dead.shape[0]):
+            H[i, dead[i], dead[i]] = 1
+        
+        print(W.shape)
+        print(H.shape)
+
+        if H.shape[0] == W.shape[0]:
+            for i in range(W.shape[0]):
+                W[i, dead[i]] = 0
+        else:
+            W[:, dead.flatten()] = 0
+        
+        damp = percdamp * torch.mean(torch.diagonal(H, dim1=-2, dim2=-1), dim=-1).unsqueeze(-1)
+        diag = torch.arange(self.in_dim, device=self.dev)
+        print(damp.shape)
+        print(diag.shape)
+        print(H[:, diag, diag].shape)
+        H[:, diag, diag] += damp
+
+        # cholesky must be torch.float32 -- this can be batched
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        H = torch.linalg.cholesky(H, upper=True).to(dtype)
+        Hinv = H
+
+        return Hinv
+    
+    def fasterquant(self, W, group_size=256, percdamp=.01, w_bits=4, dtype=torch.float32, channel_range=None, G=None):
+        t0_fasterquant = time.time()
+        bits = w_bits # 4-bit quantization
+        # W = self.layer.weight.data.clone().to(dtype)
+        device = W.device
+
+        print("Generating Hessians...")
+
+        H = self.generate_hessians(channel_range=channel_range, G=G)
+
+        print("Building Cholesky...")
+        Hinv = self.build_cholesky(W, H, percdamp, dtype)
+        
+        # del H
+        # del Hinv
+
+        # with torch.no_grad():
+        #    W.copy_(W_copy)
+
+        # print()
+        #print(self.inputs.shape)
+
+        #H = (self.inputs.permute(0, 2, 1).float().bmm(self.inputs.float())).mean(dim=0).unsqueeze(0).float()
+        # print(H.shape)
+        # Hinv = self.build_cholesky(W, H, percdamp, dtype)
+
+        # print()
+        
+        # init Losses and Q
+        assert group_size <= self.in_dim
+        Losses = torch.zeros_like(W)
+        Q = torch.zeros_like(W)
+        n_groups = math.ceil(self.in_dim / group_size)
+        group_scale = torch.zeros(n_groups, channel_range.shape[0], dtype=torch.float32, device=device)   # QQQ requires [n_groups, out_dim]
+        for i1 in range(0, self.in_dim, group_size):
+            gidx = i1 // group_size
+            i2 = min(i1 + group_size, self.in_dim)
+            count = i2 - i1
+            # get weight group
+            W1 = W[:, i1:i2].clone()
+            Q1 = torch.zeros_like(W1)
+            Err1 = torch.zeros_like(W1).float()
+            Losses1 = torch.zeros_like(W1).float()
+            Hinv1 = Hinv[:, i1:i2, i1:i2]
+            print("Hinv1.shape: ", Hinv1.shape)
+            print("W.shape: ", W.shape)
+            print("W1.shape: ", W1.shape)
+            print("Losses1.shape: ", Losses1.shape)
+            # Get per-group scale and zero
+            per_group_scale = get_per_channel_scale(W1, num_bits=bits)
+            print("per_group_scale.shape: ", per_group_scale.shape)
+            print("group_scale.shape: ", group_scale.shape)
+            group_scale[gidx] = per_group_scale.squeeze()
+            for i in range(count):
+                w = W1[:, i].clone() # [Dout]
+                d = Hinv1[:, i, i]
+                # print("d.shape", d.shape)
+                q = quant(w.unsqueeze(1), per_group_scale, num_bits=bits).flatten()
+                Q1[:, i] = q
+                Losses1[:, i] = (w - q) ** 2 / d ** 2
+                err1 = (w - q) / d      
+                # print("err1.shape: ", err1.shape) 
+                # print("err1.unsqueeze(1).shape: ", err1.unsqueeze(1).shape)
+                # print("Hinv1[:, i, i:].shape: ", Hinv1[:, i, i:].shape)
+                # print("Hinv1[:, i, i:].unsqueeze(0).shape: ", Hinv1[:, i, i:].unsqueeze(0).shape)
+                # print("err1.unsqueeze(1) * Hinv1[:, i, i:].shape: ", (err1.unsqueeze(1) * Hinv1[:, i, i:]).shape)
+                # print("W1[:, i:].shape: ", W1[:, i:].shape)
+                W1[:, i:] -= err1.unsqueeze(1) * Hinv1[:, i, i:]
+                Err1[:, i] = err1
+                # raise ValueError("Stop!!")
+
+            Q[:, i1:i2] = Q1
+            Losses[:, i1:i2] = Losses1 / 2
+            print("Err1.shape: ", Err1.shape)
+            print("Hinv[:, i1:i2, i2:].shape: ", Hinv[:, i1:i2, i2:].shape)
+            print("W[:, i2:].shape: ", W[:, i2:].shape)
+            print("Err1.unsqueeze(1) * Hinv[:, i1:i2, i2:].shape: ", (Err1.unsqueeze(1).matmul(Hinv[:, i1:i2, i2:]).shape))
+            W[:, i2:] -= Err1.unsqueeze(1).matmul(Hinv[:, i1:i2, i2:]).squeeze(1)
+        torch.cuda.synchronize()
+
+        if channel_range is None:
+            channel_range = torch.arange(self.layer.mixer.in_proj.weight.shape[0])
+
+        Q = Q.reshape(self.layer.mixer.in_proj.weight[channel_range].shape).to(self.layer.mixer.in_proj.weight.data.dtype)
+        if isinstance(self.layer, transformers.Conv1D):
+            Q = Q.t()
+
+        Q = Q.reshape(self.layer.mixer.in_proj.weight[channel_range].shape).to(self.layer.mixer.in_proj.weight.data.dtype) # fake quantized weight
+        self.layer.mixer.in_proj.weight.data[channel_range] = Q.contiguous() # [Dout, Din]
+        self.layer.apply_gptq = True
+        self.layer.bits = bits
+        self.layer.group_size = group_size
+        self.layer.group_scale = group_scale    # QQQ requires [n_groups, out_dim]
+
+        del Losses
+        del H
+        del W
+        torch.cuda.empty_cache()
+        print(f"Time taken to fasterquant for {self.name}: {time.time() - t0_fasterquant} seconds")
+    
+    def chunk_fasterquant(self, W, chunk_size=128, group_size=128, percdamp=.01, w_bits=4, dtype=torch.float32, channel_range=None, G=None):
+        for i in range(0, channel_range.shape[0], chunk_size):
+            chunk_channel_range = channel_range[i:min(i+chunk_size, channel_range.shape[0])]
+            print(f"Chunking {chunk_channel_range.shape[0]} channels ({chunk_channel_range})")
+            if G is not None:
+                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range, G=G[:, chunk_channel_range - channel_range.min(), :])
+            else:
+                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    
+    def quantize_all(self):
+        G = self.generate_gradients(max_probes=64)
+        G_z = G[:, :self.layer.mixer.d_inner, :]
+        G_x = G[:, self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner, :]
+        G_b = G[:, 2 * self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+        G_c = G[:, 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+        G_t = G[:, -self.layer.mixer.nheads:, :]
+        del G
+        W_z = self.layer.mixer.in_proj.weight[:self.layer.mixer.d_inner, :].data.clone()
+        W_x = self.layer.mixer.in_proj.weight[self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner, :].data.clone()
+        W_b = self.layer.mixer.in_proj.weight[2 * self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, :].data.clone()
+        W_c = self.layer.mixer.in_proj.weight[2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :].data.clone()
+        W_t = self.layer.mixer.in_proj.weight[-self.layer.mixer.nheads:, :].data.clone()
+
+        self.chunk_fasterquant(W_z, channel_range=torch.arange(self.layer.mixer.d_inner), G=G_z)
+        del G_z
+        self.chunk_fasterquant(W_x, channel_range=torch.arange(self.layer.mixer.d_inner) + self.layer.mixer.d_inner, G=G_x)
+        del G_x
+        self.chunk_fasterquant(W_b, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner, G=G_b)
+        del G_b
+        self.chunk_fasterquant(W_c, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_c)
+        del G_c
+        self.chunk_fasterquant(W_t, channel_range=torch.arange(self.layer.mixer.nheads) + 2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_t)
+        del G_t
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def free(self):
+        self.inputs = None
+        self.pre_outputs = None
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
 # implement GPTQ with a different J matrix
 class SMGPTQ():
     def __init__(self, layer, idx=0):
@@ -287,6 +622,8 @@ class SMGPTQ():
 
         # Cut to half the size
         self.pre_outputs = self.pre_outputs[:, :self.pre_outputs.shape[1]//2]
+        print(self.pre_outputs.shape)
+        print(self.pre_outputs)
     
     def compute_jacobian_sampled(self):
         if self.idx != 13:
@@ -696,6 +1033,7 @@ class SMGPTQ():
                 else:
                     hessian_shard[key] = hessian_tensor[i, :, :]
         print(hessian_shard.keys())
+
         if max(hessian_shard.keys()) > 3372:
             raise ValueError("Hessian keys are greater than d_inner!")
         return hessian_shard
@@ -738,6 +1076,8 @@ class SMGPTQ():
             channels = channels + 2*self.layer.d_inner + self.layer.d_state * self.layer.ngroups
 
         print(channels)
+
+        print(self.pre_outputs[:, :, channels])
 
         if tensor_name == 'b' or tensor_name == 'c':
             for c in channels:
@@ -805,10 +1145,18 @@ class SMGPTQ():
             # print(step_size)
             t0 = time.time()
             H_dict[i] = (G[:i].permute(1, 2, 0) / i).bmm(G[:i].permute(1, 0, 2))
+
+            if i % 8 == 0:
+                print(i)
+                print(H_dict[i][0])
+                print()
             times_list[int(i/step_size) - 1] += time.time() - t0
         np.save(f"jacobian_jvp_error/times/{tensor_name}/{self.idx}.npy", np.array(times_list))
         print(times_list)
         print(len(times_list))
+
+        raise ValueError("Stop!!")
+
         return H_dict
 
 

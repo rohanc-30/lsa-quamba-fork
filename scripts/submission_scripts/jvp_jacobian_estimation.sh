@@ -13,6 +13,8 @@
 #
 
 # Parse command-line arguments
+source scripts/submission_scripts/interactive_job.sh
+
 MODEL=$1
 shift  # Remove the first argument (model path) from the list
 

@@ -4,7 +4,7 @@ initialdir = /home/rcherukuri/lsa-quamba-fork
 error = logs/jvp_jacobian_estimation/mamba130m.err
 output = logs/jvp_jacobian_estimation/mamba130m.out
 log = logs/jvp_jacobian_estimation/mamba130m.log
-
+s
 request_memory = 64000
 request_cpus = 8
 request_gpus = 1
