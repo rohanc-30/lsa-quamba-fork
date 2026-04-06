@@ -508,7 +508,7 @@ def fuse_had_matrices(model, model_type="mamba"):
     return model
 
 
-def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=True):
+def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", max_probes=0):
     """
     Apply GPTQ based quantization to Mamba model layers.
 
@@ -520,9 +520,11 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=T
 
     Configures quantization over internal projections and optimizes with input statistics.
     """
+    sm_gptq = max_probes > 0
+
     # Hardcode gptq hyper-parameters for now
     nsamples = 128
-    seqlen = 1024
+    seqlen = 512
     bits = w_bits
     assert bits in [4, 8], "Only support 4 or 8 bits weights for now"
     logging.info("Start Quantized Linear Layers with GPTQ")
@@ -610,7 +612,7 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=T
         # create GPTQ objects for in_proj and out_proj
             if sm_gptq:
                 gptq = {
-                    "in_proj": GPTQMod(layer),
+                    "in_proj": GPTQMod(layer, max_probes=max_probes),
                     "out_proj": GPTQ(layer.mixer.out_proj),
                 }
 
@@ -717,6 +719,27 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=T
         output_reconstruction_errors.append((torch.norm(inps - init_outputs)).item())
         residual_reconstruction_errors.append((torch.norm(residual - init_residuals)).item())
 
+        '''
+        # analyze channelwise behavior
+        channelwise = torch.norm(inps - init_outputs, dim=[0, 1])
+        ordered_channelwise = channelwise.sort().values
+        ordered_channelwise_indices = channelwise.argsort()
+
+        print(ordered_channelwise_indices)
+        print(ordered_channelwise)
+
+        # Top 10 both ways
+        K = 10
+        print(f"Top {K} channelwise:")
+        for index, value in zip(ordered_channelwise_indices[:K], ordered_channelwise[:K]):
+            print(f"Channel {index}: {value}")
+        print(f"Bottom {K} channelwise:")
+        for index, value in zip(ordered_channelwise_indices[-K:], ordered_channelwise[-K:]):
+            print(f"Channel {index}: {value}")
+
+        raise ValueError("Stop here!")
+        '''
+
         del init_outputs, init_residuals
         
         # garbage collection and clean cache
@@ -724,6 +747,8 @@ def apply_gptq(model, tokenizer, device, w_bits=4, model_type="mamba", sm_gptq=T
         del layer
         torch.cuda.empty_cache()
         gc.collect()
+
+        # raise ValueError("Stop here!")
     
     for i in range(len(output_reconstruction_errors)):
         print(f"Layer {i} Output Reconstruction Error: {output_reconstruction_errors[i]}")
@@ -797,7 +822,7 @@ def save_jacobian_samples(model, tokenizer, device, w_bits=4, model_type="mamba"
     """
     # Hardcode gptq hyper-parameters for now
     nsamples = 128
-    seqlen = 1024
+    seqlen = 512
     bits = w_bits
     assert bits in [4, 8], "Only support 4 or 8 bits weights for now"
     logging.info("Start Quantized Linear Layers with GPTQ")
@@ -1385,7 +1410,8 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     print(args.apply_gptq)
     if args.apply_gptq:
         # save_jacobian_samples(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
-        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type)
+        max_probes = args.max_probes if args.max_probes is not None else 0
+        model = apply_gptq(model, tokenizer, device, w_bits=args.w_bits, model_type=model_type, max_probes=max_probes)
         print(model)
     # Replace (reordered, fused, and GPTQ quantized) modules with quantized version
     

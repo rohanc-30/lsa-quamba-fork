@@ -4,6 +4,7 @@ MODEL=$1
 PRECISION=$2
 APPLY_GPTQ=$3
 USE_HADAMARD_TRANSFORM=$4
+MAX_PROBES=$5
 
 if [[ -z "$MODEL" ]]; then
   echo "Usage: $0 <model> [precision]"
@@ -61,6 +62,10 @@ fi
 
 if [[ "$USE_HADAMARD_TRANSFORM" == "true" ]]; then
   CMD+=" --use_hadamard_transform"
+fi
+
+if [[ "$MAX_PROBES" != "none" ]]; then
+  CMD+=" --max_probes $MAX_PROBES"
 fi
 
 echo "Running: $CMD"

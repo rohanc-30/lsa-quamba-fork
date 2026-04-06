@@ -227,6 +227,10 @@ def get_quantize_options(parser):
         help='Whether to use the hadamard transform (default: False)'
     )
     parser.add_argument(
+        '--max_probes', type=int, default=0,
+        help='The maximum number of probes for the GPTQ quantizer (default: 0)'
+    )
+    parser.add_argument(
         '--w_bits', type=int, default=8,
         help='The bit-width for weights applied in the real quantization (default: 8)'
     )

@@ -6,6 +6,7 @@ import math
 # from tarfile import _Bz2ReadableFileobj
 import time
 import gc
+from tkinter import N
 from unittest import BaseTestSuite
 
 import matplotlib.pyplot as plt
@@ -152,9 +153,9 @@ class GPTQ:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
-        print(f"Time taken to compute Hessian for {self.name}: {time.time() - t0_hessian} seconds")
     
     def fasterquant(self, group_size=128, percdamp=.01, w_bits=4, dtype=torch.float32):
+        W_copy = self.layer.weight.data.clone()
         t0_fasterquant = time.time()
         bits = w_bits # 4-bit quantization
         W = self.layer.weight.data.clone().to(dtype)
@@ -224,7 +225,7 @@ class GPTQ:
         del H
         del W
         torch.cuda.empty_cache()
-        print(f"Time taken to fasterquant for {self.name}: {time.time() - t0_fasterquant} seconds")
+        print(torch.norm(self.layer.weight - W_copy)/torch.norm(W_copy))
 
     def free(self):
         self.H = None
@@ -233,14 +234,14 @@ class GPTQ:
 
 
 class GPTQMod:
-    def __init__(self, layer, idx=0):
+    def __init__(self, layer, idx=0, max_probes=0):
         self.idx = idx
-
+        self.max_probes = max_probes
         # print(self.idx)
 
         # print(layer)
         self.layer = layer
-        print(layer)
+        # print(layer)
         self.dev = self.layer.mixer.in_proj.weight.device
         # HY: To save memory, we use float16 to compute distances for non-uniform quantization
         #     see datatype_utils.py for def fake_quantize_with_type 
@@ -275,7 +276,7 @@ class GPTQMod:
         # print(self.layer)
         # print()
         self.inputs = inp
-        print(self.inputs.shape)
+        # print(self.inputs.shape)
 
     def capture_outputs(self, x, z, out):
         print(x.shape)
@@ -290,11 +291,12 @@ class GPTQMod:
 
         # Cut to half the size
         # self.pre_outputs = self.pre_outputs[:, :self.pre_outputs.shape[1]//2]
-        print(self.pre_outputs.shape)
-        print(self.pre_outputs)
+        # print(self.pre_outputs.shape)
+        # print(self.pre_outputs)
     
     def generate_gradients(self, max_probes=64, channel_range=None):
-        print("Computing JVPs...")
+        # print(channel_range)
+        # print("Computing JVPs...")
 
         Gs = []
         for i in range(max_probes):
@@ -311,7 +313,7 @@ class GPTQMod:
             scalar = prod.mean(dim=0).sum()
             del rand_probes
             del prod
-            print(i, scalar)
+            # print(i, scalar)
             gi, = torch.autograd.grad(
                 outputs=scalar, inputs=self.layer.mixer.in_proj.weight,
                 retain_graph=True,
@@ -321,7 +323,7 @@ class GPTQMod:
             if channel_range is not None:
                 gi = gi[channel_range, :]
             Gs.append(gi)
-            print(i, gi)
+            #print(i, gi)
             del scalar
             del gi
             gc.collect()
@@ -329,12 +331,14 @@ class GPTQMod:
         G = torch.stack(Gs, dim=0)
         del Gs
         gc.collect()
-        print(G.shape)
-        print(G)
+        # print(G.shape)
+        # print(G)
 
-        G = G.double()
+        # G = G.float()
         # G = G/G.norm()
 
+
+        '''
         # check for nan/inf in G
         if torch.isnan(G).any() or torch.isinf(G).any():
             print("NaN in G")
@@ -356,6 +360,7 @@ class GPTQMod:
 
 
             print("NaN in G, continuing...")
+        '''
 
         torch.cuda.empty_cache()
         return G
@@ -365,15 +370,16 @@ class GPTQMod:
             G = self.generate_gradients(max_probes, channel_range)
         else:
             print("Using provided G")
-        print(G.shape)
-        print(G)
+        # print(G.shape)
+        # print(G)
+        G = G.float()
 
-        print("Generating Hessian...")
+        # print("Generating Hessian...")
 
 
         H = (G.permute(1, 2, 0)/max_probes @ G.permute(1, 0, 2))
-        print(H.shape)
-        print(H[0])
+        # print(H.shape)
+        # print(H[0])
         if torch.isnan(H).any() or torch.isinf(H).any():
             print("NaN in H")
 
@@ -398,8 +404,8 @@ class GPTQMod:
         for i in range(dead.shape[0]):
             H[i, dead[i], dead[i]] = 1
         
-        print(W.shape)
-        print(H.shape)
+        # print(W.shape)
+        # print(H.shape)
 
         if H.shape[0] == W.shape[0]:
             for i in range(W.shape[0]):
@@ -409,9 +415,9 @@ class GPTQMod:
         
         damp = percdamp * torch.mean(torch.diagonal(H, dim1=-2, dim2=-1), dim=-1).unsqueeze(-1)
         diag = torch.arange(self.in_dim, device=self.dev)
-        print(damp.shape)
-        print(diag.shape)
-        print(H[:, diag, diag].shape)
+        # print(damp.shape)
+        # print(diag.shape)
+        # print(H[:, diag, diag].shape)
         H[:, diag, diag] += damp
 
         # cholesky must be torch.float32 -- this can be batched
@@ -422,17 +428,17 @@ class GPTQMod:
 
         return Hinv
     
-    def fasterquant(self, W, group_size=256, percdamp=.01, w_bits=4, dtype=torch.float32, channel_range=None, G=None):
+    def fasterquant(self, W, group_size=128, percdamp=.01, w_bits=4, dtype=torch.float32, channel_range=None, G=None):
         t0_fasterquant = time.time()
         bits = w_bits # 4-bit quantization
         # W = self.layer.weight.data.clone().to(dtype)
         device = W.device
 
-        print("Generating Hessians...")
+        # print("Generating Hessians...")
 
-        H = self.generate_hessians(channel_range=channel_range, G=G)
+        H = self.generate_hessians(channel_range=channel_range, G=G, max_probes=self.max_probes)
 
-        print("Building Cholesky...")
+        # print("Building Cholesky...")
         Hinv = self.build_cholesky(W, H, percdamp, dtype)
         
         # del H
@@ -466,14 +472,14 @@ class GPTQMod:
             Err1 = torch.zeros_like(W1).float()
             Losses1 = torch.zeros_like(W1).float()
             Hinv1 = Hinv[:, i1:i2, i1:i2]
-            print("Hinv1.shape: ", Hinv1.shape)
-            print("W.shape: ", W.shape)
-            print("W1.shape: ", W1.shape)
-            print("Losses1.shape: ", Losses1.shape)
+            # print("Hinv1.shape: ", Hinv1.shape)
+            # print("W.shape: ", W.shape)
+            # print("W1.shape: ", W1.shape)
+            # print("Losses1.shape: ", Losses1.shape)
             # Get per-group scale and zero
             per_group_scale = get_per_channel_scale(W1, num_bits=bits)
-            print("per_group_scale.shape: ", per_group_scale.shape)
-            print("group_scale.shape: ", group_scale.shape)
+            # print("per_group_scale.shape: ", per_group_scale.shape)
+            # print("group_scale.shape: ", group_scale.shape)
             group_scale[gidx] = per_group_scale.squeeze()
             for i in range(count):
                 w = W1[:, i].clone() # [Dout]
@@ -495,10 +501,10 @@ class GPTQMod:
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
-            print("Err1.shape: ", Err1.shape)
-            print("Hinv[:, i1:i2, i2:].shape: ", Hinv[:, i1:i2, i2:].shape)
-            print("W[:, i2:].shape: ", W[:, i2:].shape)
-            print("Err1.unsqueeze(1) * Hinv[:, i1:i2, i2:].shape: ", (Err1.unsqueeze(1).matmul(Hinv[:, i1:i2, i2:]).shape))
+            # print("Err1.shape: ", Err1.shape)
+            # print("Hinv[:, i1:i2, i2:].shape: ", Hinv[:, i1:i2, i2:].shape)
+            # print("W[:, i2:].shape: ", W[:, i2:].shape)
+            # print("Err1.unsqueeze(1) * Hinv[:, i1:i2, i2:].shape: ", (Err1.unsqueeze(1).matmul(Hinv[:, i1:i2, i2:]).shape))
             W[:, i2:] -= Err1.unsqueeze(1).matmul(Hinv[:, i1:i2, i2:]).squeeze(1)
         torch.cuda.synchronize()
 
@@ -525,40 +531,66 @@ class GPTQMod:
     def chunk_fasterquant(self, W, chunk_size=128, group_size=128, percdamp=.01, w_bits=4, dtype=torch.float32, channel_range=None, G=None):
         for i in range(0, channel_range.shape[0], chunk_size):
             chunk_channel_range = channel_range[i:min(i+chunk_size, channel_range.shape[0])]
-            print(f"Chunking {chunk_channel_range.shape[0]} channels ({chunk_channel_range})")
+            # print(f"Chunking {chunk_channel_range.shape[0]} channels ({chunk_channel_range})")
             if G is not None:
-                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range, G=G[:, chunk_channel_range - channel_range.min(), :])
+                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range, G=G[:, chunk_channel_range - channel_range.min(), :], group_size=group_size)
             else:
-                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range)
+                self.fasterquant(W[chunk_channel_range - channel_range.min(), :], channel_range=chunk_channel_range, group_size=group_size)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
     
     def quantize_all(self):
-        G = self.generate_gradients(max_probes=64)
-        G_z = G[:, :self.layer.mixer.d_inner, :]
-        G_x = G[:, self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner, :]
-        G_b = G[:, 2 * self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
-        G_c = G[:, 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
-        G_t = G[:, -self.layer.mixer.nheads:, :]
-        del G
+        W_copy = self.layer.mixer.in_proj.weight.data.clone()
+        chunk_size = 128
         W_z = self.layer.mixer.in_proj.weight[:self.layer.mixer.d_inner, :].data.clone()
         W_x = self.layer.mixer.in_proj.weight[self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner, :].data.clone()
         W_b = self.layer.mixer.in_proj.weight[2 * self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, :].data.clone()
         W_c = self.layer.mixer.in_proj.weight[2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :].data.clone()
         W_t = self.layer.mixer.in_proj.weight[-self.layer.mixer.nheads:, :].data.clone()
+        if self.max_probes < 512:
+            G = self.generate_gradients(max_probes=self.max_probes)
+            G_z = G[:, :self.layer.mixer.d_inner, :]
+            G_x = G[:, self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner, :]
+            G_b = G[:, 2 * self.layer.mixer.d_inner:2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+            G_c = G[:, 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+            G_t = G[:, -self.layer.mixer.nheads:, :]
+            del G
 
-        self.chunk_fasterquant(W_z, channel_range=torch.arange(self.layer.mixer.d_inner), G=G_z)
-        del G_z
-        self.chunk_fasterquant(W_x, channel_range=torch.arange(self.layer.mixer.d_inner) + self.layer.mixer.d_inner, G=G_x)
-        del G_x
-        self.chunk_fasterquant(W_b, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner, G=G_b)
-        del G_b
-        self.chunk_fasterquant(W_c, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_c)
-        del G_c
-        self.chunk_fasterquant(W_t, channel_range=torch.arange(self.layer.mixer.nheads) + 2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_t)
-        del G_t
-        torch.cuda.empty_cache()
-        gc.collect()
+            self.chunk_fasterquant(W_z, channel_range=torch.arange(self.layer.mixer.d_inner), G=G_z, chunk_size=chunk_size)
+            del G_z
+            self.chunk_fasterquant(W_x, channel_range=torch.arange(self.layer.mixer.d_inner) + self.layer.mixer.d_inner, G=G_x, chunk_size=chunk_size)
+            del G_x
+            self.chunk_fasterquant(W_b, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner, G=G_b, chunk_size=chunk_size)
+            del G_b
+            self.chunk_fasterquant(W_c, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_c, chunk_size=chunk_size)
+            del G_c
+            self.chunk_fasterquant(W_t, channel_range=torch.arange(self.layer.mixer.nheads) + 2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_t, chunk_size=chunk_size)
+            del G_t
+            torch.cuda.empty_cache()
+            gc.collect()
+            # print(torch.norm(self.layer.mixer.in_proj.weight - W_copy)/torch.norm(W_copy))
+        else:
+            G_z = self.generate_gradients(max_probes=self.max_probes, channel_range=torch.arange(self.layer.mixer.d_inner))
+
+            self.chunk_fasterquant(W_z, channel_range=torch.arange(self.layer.mixer.d_inner), G=G_z, chunk_size=chunk_size)
+            del G_z
+            G_x = self.generate_gradients(max_probes=self.max_probes, channel_range=torch.arange(self.layer.mixer.d_inner) + self.layer.mixer.d_inner)
+            self.chunk_fasterquant(W_x, channel_range=torch.arange(self.layer.mixer.d_inner) + self.layer.mixer.d_inner, G=G_x, chunk_size=chunk_size)
+            del G_x
+            G_bct = self.generate_gradients(max_probes=self.max_probes, channel_range=torch.arange(self.layer.mixer.nheads + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner)
+            G_b = G_bct[:, :self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+            G_c = G_bct[:, self.layer.mixer.ngroups * self.layer.mixer.d_state:2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, :]
+            G_t = G_bct[:, 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state:, :]
+            del G_bct
+            self.chunk_fasterquant(W_b, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner, G=G_b, chunk_size=chunk_size)
+            del G_b
+            self.chunk_fasterquant(W_c, channel_range=torch.arange(self.layer.mixer.ngroups * self.layer.mixer.d_state) + 2 * self.layer.mixer.d_inner + self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_c, chunk_size=chunk_size)
+            del G_c
+            self.chunk_fasterquant(W_t, channel_range=torch.arange(self.layer.mixer.nheads) + 2 * self.layer.mixer.d_inner + 2 * self.layer.mixer.ngroups * self.layer.mixer.d_state, G=G_t, chunk_size=chunk_size)
+            del G_t
+            torch.cuda.empty_cache()
+            gc.collect()
+            # print(torch.norm(self.layer.mixer.in_proj.weight - W_copy)/torch.norm(W_copy))
 
     def free(self):
         self.inputs = None
